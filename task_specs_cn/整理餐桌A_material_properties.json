@@ -1,0 +1,84 @@
+{
+  "materials": {
+    "餐桌": {
+      "name": "餐桌",
+      "category": "surface",
+      "properties": ["SURFACES", "STATIC"]
+    },
+    "大碗": {
+      "name": "大碗",
+      "category": "container",
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "OCCLUDER"]
+    },
+    "中碗": {
+      "name": "中碗",
+      "category": "container",
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS"]
+    },
+    "小碗": {
+      "name": "小碗",
+      "category": "container",
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS"]
+    },
+    "蘸碟": {
+      "name": "蘸碟",
+      "category": "container",
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS"]
+    },
+    "盘子": {
+      "name": "盘子",
+      "category": "surface",
+      "properties": ["GRABBABLE", "MOVABLE", "SURFACES", "CONTAINERS"]
+    },
+    "勺子": {
+      "name": "勺子",
+      "category": "tool",
+      "properties": ["GRABBABLE", "MOVABLE"]
+    },
+    "水杯": {
+      "name": "水杯",
+      "category": "container",
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS"]
+    },
+    "托盘": {
+      "name": "托盘",
+      "category": "surface",
+      "properties": ["GRABBABLE", "MOVABLE", "SURFACES"]
+    },
+    "筷子收纳架": {
+      "name": "筷子收纳架",
+      "category": "container",
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "DECOMPOSABLE"],
+      "parts": [
+        {
+          "id": "筷子收纳架第一格",
+          "name": "筷子收纳架第一格",
+          "category": "container",
+          "properties": ["CONTAINERS", "STATIC"]
+        },
+        {
+          "id": "筷子收纳架第二格",
+          "name": "筷子收纳架第二格",
+          "category": "container",
+          "properties": ["CONTAINERS", "STATIC"]
+        }
+      ]
+    },
+    "水果": {
+      "name": "水果",
+      "category": "food",
+      "properties": ["GRABBABLE", "MOVABLE", "COPYABLE"]
+    },
+    "蔬菜": {
+      "name": "蔬菜",
+      "category": "food",
+      "properties": ["GRABBABLE", "MOVABLE", "COPYABLE"]
+    },
+    "菜篮": {
+      "name": "菜篮",
+      "category": "container",
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "CAN_OPEN", "OCCLUDER", "SURFACES"],
+      "states": ["OPEN"]
+    }
+  }
+}

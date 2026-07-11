@@ -1,0 +1,9 @@
+{
+  "profile_id": "desk_stress",
+  "spatial": {
+    "enabled": true,
+    "num_occluded_objects": 5,
+    "occlusion_depth": 3,
+    "num_decomposed_parents": 3
+  }
+}

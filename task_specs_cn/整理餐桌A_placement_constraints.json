@@ -1,0 +1,5 @@
+{
+  "nonexistent_edges": [
+    {"from": "*", "to": "盘子", "relation": "OCCLUDES"}
+  ]
+}

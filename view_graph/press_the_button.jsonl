@@ -1,0 +1,1 @@
+{"scene_id":"press_the_button_scene","env_id":"press_the_button_scene","layout":"tabletop","robot":{"arms":"single"},"nodes":[{"id":"桌面","name":"桌面","category":"surface","properties":["SURFACES"]},{"id":"按钮","name":"按钮","category":"object","properties":["PRESSABLE"]}],"edges":[{"from":"按钮","to":"桌面","relation":"ON"}]}

@@ -1,0 +1,9 @@
+{
+  "profile_id": "desk_easy",
+  "spatial": {
+    "enabled": true,
+    "num_occluded_objects": 1,
+    "occlusion_depth": 1,
+    "num_decomposed_parents": 0
+  }
+}

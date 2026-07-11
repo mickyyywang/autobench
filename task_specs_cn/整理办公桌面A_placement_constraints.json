@@ -1,0 +1,5 @@
+{
+  "nonexistent_edges": [
+    {"from": "*", "to": "书", "relation": "OCCLUDES"}
+  ]
+}

@@ -1,0 +1,251 @@
+{
+  "materials": {
+    "桌面": {
+      "name": "桌面",
+      "category": "surface",
+      "properties": [
+        "SURFACES"
+      ]
+    },
+    "化妆品收纳袋": {
+      "name": "化妆品收纳袋",
+      "category": "container",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "CONTAINERS",
+        "CAN_OPEN",
+        "OCCLUDER",
+        "COPYABLE"
+      ],
+      "states": [
+        "OPEN"
+      ]
+    },
+    "口红": {
+      "name": "口红",
+      "category": "object",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE",
+        "DECOMPOSABLE"
+      ],
+      "parts": [
+        {
+          "id": "口红管身",
+          "name": "口红管身",
+          "category": "object",
+          "properties": [
+            "GRABBABLE",
+            "MOVABLE",
+            "COPYABLE"
+          ]
+        },
+        {
+          "id": "口红盖",
+          "name": "口红盖",
+          "category": "object",
+          "properties": [
+            "GRABBABLE",
+            "MOVABLE",
+            "COPYABLE"
+          ]
+        }
+      ]
+    },
+    "粉底液": {
+      "name": "粉底液",
+      "category": "object",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE",
+        "DECOMPOSABLE"
+      ],
+      "parts": [
+        {
+          "id": "粉底液瓶身",
+          "name": "粉底液瓶身",
+          "category": "object",
+          "properties": [
+            "GRABBABLE",
+            "MOVABLE",
+            "COPYABLE"
+          ]
+        },
+        {
+          "id": "粉底液盖",
+          "name": "粉底液盖",
+          "category": "object",
+          "properties": [
+            "GRABBABLE",
+            "MOVABLE",
+            "COPYABLE"
+          ]
+        }
+      ]
+    },
+    "隔离乳": {
+      "name": "隔离乳",
+      "category": "object",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE",
+        "DECOMPOSABLE"
+      ],
+      "parts": [
+        {
+          "id": "隔离乳瓶身",
+          "name": "隔离乳瓶身",
+          "category": "object",
+          "properties": [
+            "GRABBABLE",
+            "MOVABLE",
+            "COPYABLE"
+          ]
+        },
+        {
+          "id": "隔离乳盖",
+          "name": "隔离乳盖",
+          "category": "object",
+          "properties": [
+            "GRABBABLE",
+            "MOVABLE",
+            "COPYABLE"
+          ]
+        }
+      ]
+    },
+    "散粉": {
+      "name": "散粉",
+      "category": "container",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE"
+      ]
+    },
+    "美妆蛋": {
+      "name": "美妆蛋",
+      "category": "object",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE"
+      ]
+    },
+    "睫毛膏": {
+      "name": "睫毛膏",
+      "category": "tool",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE"
+      ]
+    },
+    "眉笔": {
+      "name": "眉笔",
+      "category": "tool",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE"
+      ]
+    },
+    "遮瑕膏": {
+      "name": "遮瑕膏",
+      "category": "object",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE"
+      ]
+    },
+    "眼线笔": {
+      "name": "眼线笔",
+      "category": "tool",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE"
+      ]
+    },
+    "化妆刷": {
+      "name": "化妆刷",
+      "category": "tool",
+      "properties": [
+        "GRABBABLE",
+        "MOVABLE",
+        "COPYABLE"
+      ]
+    },
+    "圆柱形笔筒": {
+      "name": "圆柱形笔筒",
+      "category": "container",
+      "properties": [
+        "CONTAINERS",
+        "OCCLUDER",
+        "STATIC"
+      ]
+    },
+    "收纳盒": {
+      "name": "收纳盒",
+      "category": "furniture",
+      "properties": [
+        "STORAGE_UNIT",
+        "SURFACES",
+        "DECOMPOSABLE",
+        "STATIC"
+      ],
+      "parts": [
+        {
+          "id": "收纳盒第一层",
+          "name": "收纳盒第一层",
+          "category": "container",
+          "properties": [
+            "CONTAINERS",
+            "CAN_OPEN",
+            "OCCLUDER",
+            "STATIC"
+          ],
+          "states": [
+            "CLOSED"
+          ],
+          "max_items": 2
+        },
+        {
+          "id": "收纳盒第二层",
+          "name": "收纳盒第二层",
+          "category": "container",
+          "properties": [
+            "CONTAINERS",
+            "CAN_OPEN",
+            "OCCLUDER",
+            "STATIC"
+          ],
+          "states": [
+            "CLOSED"
+          ],
+          "max_items": 2
+        },
+        {
+          "id": "收纳盒第三层",
+          "name": "收纳盒第三层",
+          "category": "container",
+          "properties": [
+            "CONTAINERS",
+            "CAN_OPEN",
+            "OCCLUDER",
+            "STATIC"
+          ],
+          "states": [
+            "CLOSED"
+          ],
+          "max_items": 2
+        }
+      ]
+    }
+  }
+}

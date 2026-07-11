@@ -1,0 +1,9 @@
+{
+  "profile_id": "desk_medium",
+  "spatial": {
+    "enabled": true,
+    "num_occluded_objects": 2,
+    "occlusion_depth": 1,
+    "num_decomposed_parents": 1
+  }
+}

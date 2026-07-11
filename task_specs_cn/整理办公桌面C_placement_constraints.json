@@ -1,0 +1,7 @@
+  {
+    "nonexistent_edges": [
+      {"object": "书", "target": "抽屉第一层", "action": "putin"},
+      {"object": "书", "target": "抽屉第二层", "action": "putin"},
+      {"object": "书", "target": "抽屉第三层", "action": "putin"}
+    ]
+  }
