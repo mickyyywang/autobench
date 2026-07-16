@@ -11,16 +11,17 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
-from openai import APITimeoutError, OpenAI
+from openai import OpenAI
 
 from .action_model import ACTION_SCHEMAS, action_model_trace
+from .brain import BrainHarness, BrainPolicy, BrainPolicyConfig, BrainRequest
 from .graph_io import load_view_graphs_jsonl
 from .goal import evaluate_goal_expression, extract_goal_predicates, normalize_goal_expression
 from .models import Node, TaskRecord, ViewGraph, normalize_relation
 from .placement_constraints import PlacementEdgeConstraints, load_placement_edge_constraints
 
 
-LOCATION_RELATIONS = {"ON", "INSIDE", "IN"}
+LOCATION_RELATIONS = {"ON", "INSIDE", "IN", "BENEATH"}
 BLOCKING_RELATIONS = {
     "OCCLUDES",
     "PARTIALLY_OCCLUDES",
@@ -120,6 +121,10 @@ class TeacherPolicyConfig:
     api_base_url: str | None = None
     timeout_seconds: int = 60
     temperature: float = 0.0
+    max_attempts: int = 1
+    retry_backoff_seconds: float = 5.0
+    retry_max_seconds: float = 60.0
+    api_style: str = "chat_completions"
 
 
 class TeacherPolicyProtocol(Protocol):
@@ -218,8 +223,8 @@ ACTION_DESCRIPTIONS = {
     "open": "Open a visible closed openable container or reveal-capable object.",
     "close": "Close a visible open openable container.",
     "press": "Press a visible reachable object with PRESSABLE affordance.",
-    "grab": "Hold a visible reachable grabbable movable object.",
-    "pick": "Alias of grab.",
+    "grab": "Try to hold a visible reachable grabbable movable object; loaded carriers may reject the attempt.",
+    "pick": "Alias of grab; loaded carriers may reject the attempt.",
     "attach": "Attach two visible or held compatible part nodes.",
     "assemble": "Assemble a visible object when all parts are reachable.",
     "puton": "Place a held object on a visible surface.",
@@ -273,6 +278,7 @@ def _teacher_user_prompt(task: TaskRecord, observation: dict[str, Any], history:
         "valid_actions": valid_actions,
         "action_constraints": [
             "Choose one action object exactly from valid_actions; copy its name, object, target, and node_ids.",
+            "valid_actions are actions that may be attempted, not a guarantee of execution success; use a non-injected failure to replan.",
             "Before choosing any valid action, always check whether success_criterion is already satisfied; if it is satisfied, choose stop.",
             "Use current_observation.robot.hands and action_catalog hand_usage to reason about hand availability; do not ignore held objects.",
             "After an injected failure, valid_actions contains recover and stop; choose recover to continue or stop to submit the current state.",
@@ -321,6 +327,8 @@ def _allowed_teacher_nodes(observation: dict[str, Any]) -> tuple[list[str], list
 def _teacher_action_catalog() -> dict[str, dict[str, Any]]:
     catalog: dict[str, dict[str, Any]] = {}
     for action in AVAILABLE_ACTIONS:
+        if action == "pick":
+            continue
         schema = ACTION_SCHEMAS.get(action)
         catalog[action] = {
             "description": ACTION_DESCRIPTIONS[action],
@@ -373,6 +381,7 @@ def _valid_teacher_actions(observation: dict[str, Any], history: list[dict[str, 
     ]
     actions: list[dict[str, Any]] = []
     seen: set[tuple[str, tuple[str, ...]]] = set()
+    open_priority_node_ids: set[str] = set()
 
     def add(name: str, node_ids: list[str] | None = None, **extra: Any) -> None:
         node_ids = [str(node_id) for node_id in (node_ids or [])]
@@ -407,16 +416,24 @@ def _valid_teacher_actions(observation: dict[str, Any], history: list[dict[str, 
         node_id = str(node.get("id"))
         if not node_id:
             continue
-        if node.get("openable") and not node.get("open") and not held_ids:
+        can_open = bool(
+            node.get("openable")
+            and not node.get("open")
+            and not held_ids
+            and _teacher_node_on_surface(node, visible_by_id)
+        )
+        if can_open:
             extra = _reveal_action_extra(node) if node.get("container") else {}
             add("open", [node_id], **extra)
+            if not node.get("inspected"):
+                open_priority_node_ids.add(node_id)
         if node.get("openable") and node.get("open") and not held_ids:
             add("close", [node_id])
         if node.get("pressable") and node.get("reachable"):
             add("press", [node_id])
         for reveal_action in _reveal_valid_actions(node):
             add(reveal_action, [node_id], **_reveal_action_extra(node))
-        if node.get("grabbable") and node.get("movable") and node.get("reachable"):
+        if node_id not in open_priority_node_ids and node.get("grabbable") and node.get("movable") and node.get("reachable"):
             add("grab", [node_id])
 
     part_nodes = [
@@ -443,7 +460,7 @@ def _valid_teacher_actions(observation: dict[str, Any], history: list[dict[str, 
             target_id = str(target["id"])
             if target_id == held_id:
                 continue
-            if target.get("container") and (not target.get("openable") or target.get("open")) and not target.get("is_full"):
+            if target.get("container") and (not target.get("openable") or target.get("open")):
                 add("putin", [held_id, target_id])
             if target.get("surface"):
                 add("puton", [held_id, target_id])
@@ -455,10 +472,25 @@ def _valid_teacher_actions(observation: dict[str, Any], history: list[dict[str, 
     return actions
 
 
+def _teacher_node_on_surface(node: dict[str, Any], visible_by_id: dict[str, dict[str, Any]]) -> bool:
+    location = node.get("location")
+    if not isinstance(location, dict):
+        return False
+    if str(location.get("relation") or "").upper() not in {"ON", "BENEATH"}:
+        return False
+    target_id = location.get("target")
+    if target_id is None:
+        return False
+    target = visible_by_id.get(str(target_id))
+    return bool(target and target.get("surface"))
+
+
 def _reveal_valid_actions(node: dict[str, Any]) -> list[str]:
     if int(node.get("occludes_hidden_count") or 0) <= 0:
         return []
     if node.get("container"):
+        if (not node.get("openable") or node.get("open")) and node.get("movable"):
+            return ["move_aside"]
         return []
     if node.get("movable"):
         return ["move_aside"]
@@ -598,22 +630,50 @@ def _new_visible_nodes(before: dict[str, Any], after: dict[str, Any]) -> list[di
     return new_nodes
 
 
+class SymbolicObservationAdapter:
+    def build_request(
+        self,
+        *,
+        task: TaskRecord,
+        observation: dict[str, Any],
+        history: list[dict[str, Any]],
+    ) -> BrainRequest:
+        return BrainRequest(
+            messages=[
+                {"role": "system", "content": TEACHER_SYSTEM_PROMPT},
+                {"role": "user", "content": _teacher_user_prompt(task, observation, history)},
+            ],
+            summary={"adapter": "symbolic", "has_view_graph": True, "frame_count": 0},
+        )
+
+    def parse_response(self, text: str) -> TeacherDecision:
+        return parse_teacher_decision(text)
+
+
 class TeacherPolicy:
     def __init__(self, config: TeacherPolicyConfig) -> None:
-        if config.provider not in {"openai", "qwen", "compatible"}:
-            raise ValueError(f"Unknown teacher provider {config.provider!r}; use openai, qwen, or compatible")
         self.config = config
         self.model = config.model or os.environ.get("AUTO_EMBODIED_TEACHER_MODEL") or _default_teacher_model(
             config.provider
         )
-        api_key_env = _teacher_api_key_env(config.provider, config.api_key_env)
-        key = config.api_key or os.environ.get(api_key_env)
-        if not key:
-            raise RuntimeError(f"Missing API key. Set {api_key_env} or pass api_key.")
-        self.client = OpenAI(
-            api_key=key,
-            base_url=_teacher_api_base_url(config.provider, config.api_base_url),
-            timeout=config.timeout_seconds,
+        self.brain_harness = BrainHarness(
+            BrainPolicy(
+                BrainPolicyConfig(
+                    provider=config.provider,
+                    model=self.model,
+                    api_key=config.api_key,
+                    api_key_env=config.api_key_env,
+                    api_base_url=config.api_base_url,
+                    timeout_seconds=config.timeout_seconds,
+                    temperature=config.temperature,
+                    max_attempts=config.max_attempts,
+                    retry_backoff_seconds=config.retry_backoff_seconds,
+                    retry_max_seconds=config.retry_max_seconds,
+                    api_style=config.api_style,
+                ),
+                client_factory=OpenAI,
+            ),
+            SymbolicObservationAdapter(),
         )
 
     def act(
@@ -623,33 +683,7 @@ class TeacherPolicy:
         observation: dict[str, Any],
         history: list[dict[str, Any]],
     ) -> TeacherDecision:
-        messages = [
-            {"role": "system", "content": TEACHER_SYSTEM_PROMPT},
-            {"role": "user", "content": _teacher_user_prompt(task, observation, history)},
-        ]
-        create_kwargs: dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": self.config.temperature,
-            "response_format": {"type": "json_object"},
-        }
-        if self.config.provider == "qwen":
-            create_kwargs["extra_body"] = {"enable_thinking": False}
-        try:
-            completion = self.client.chat.completions.create(**create_kwargs)
-        except (TimeoutError, APITimeoutError) as exc:
-            raise RuntimeError(
-                f"{self.config.provider} teacher API request timed out after "
-                f"{self.config.timeout_seconds} seconds."
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(f"{self.config.provider} teacher API request failed: {exc}") from exc
-        if not completion.choices:
-            raise RuntimeError(f"{self.config.provider} teacher API returned no choices")
-        content = completion.choices[0].message.content
-        if not content:
-            raise RuntimeError(f"{self.config.provider} teacher API returned empty content")
-        return parse_teacher_decision(content)
+        return self.brain_harness.decide(task=task, observation=observation, history=history)
 
 
 class ScriptedTeacherPolicy:
@@ -686,6 +720,12 @@ def parse_teacher_decision(text: str) -> TeacherDecision:
             raw_response=raw,
             parse_error=str(exc),
         )
+    # Some JSON-mode providers (notably Gemini through ModelRouter) wrap the
+    # requested object in a singleton array even though the prompt asks for an
+    # object.  This is unambiguous to normalize; larger or non-object arrays
+    # remain invalid responses.
+    if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+        parsed = parsed[0]
     if not isinstance(parsed, dict):
         return TeacherDecision(
             action=ParsedAction(name="invalid_teacher_action", raw=raw),
@@ -781,24 +821,6 @@ def _default_teacher_model(provider: str) -> str:
     if provider == "openai":
         return "gpt-4o-mini"
     return "model"
-
-
-def _teacher_api_key_env(provider: str, override: str | None) -> str:
-    if override:
-        return override
-    if provider == "qwen":
-        return "DASHSCOPE_API_KEY"
-    return "OPENAI_API_KEY"
-
-
-def _teacher_api_base_url(provider: str, override: str | None) -> str | None:
-    if override:
-        return override
-    if provider == "qwen":
-        return "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    if provider == "compatible":
-        return os.environ.get("OPENAI_BASE_URL")
-    return None
 
 
 def parse_plan_action(plan_step: str) -> ParsedAction:
@@ -906,14 +928,12 @@ class SemanticWorld:
         self.focus: str | None = None
         self.visited: list[str] = []
         self.events: list[dict[str, Any]] = []
-        self.active_occlusion_edges: set[tuple[str, str, str]] = {
-            (edge.source, edge.target, edge.relation)
-            for edge in graph.edges
-            if edge.relation in OCCLUSION_RELATIONS
-        }
+        self.active_occlusion_edges: set[tuple[str, str, str]] = set()
+        self.occlusion_edge_resolution_actions: dict[tuple[str, str, str], str] = {}
         self._name_to_id = self._build_name_lookup(graph)
         self.memory_hidden: dict[str, str] = self._memory_hidden_targets(task)
         self._initialize_states()
+        self._initialize_occlusion_edges()
 
     @staticmethod
     def _build_name_lookup(graph: ViewGraph) -> dict[str, str]:
@@ -948,6 +968,26 @@ class SemanticWorld:
                 open=is_open,
                 pressed=is_pressed,
             )
+
+    def _initialize_occlusion_edges(self) -> None:
+        for edge in self.graph.edges:
+            if edge.relation not in OCCLUSION_RELATIONS:
+                continue
+            key = (edge.source, edge.target, edge.relation)
+            self.active_occlusion_edges.add(key)
+            self.occlusion_edge_resolution_actions[key] = self._default_occlusion_resolution_action(edge.source)
+
+    def _default_occlusion_resolution_action(self, source_id: str) -> str:
+        source = self.states.get(source_id)
+        if source is None:
+            return "move_aside"
+        if source.node.is_container:
+            if source.node.is_openable and not source.open:
+                return "open"
+            if source.node.is_movable:
+                return "move_aside"
+            return "open"
+        return "move_aside"
 
     def _initial_location(self, node: Node) -> tuple[str | None, str | None]:
         for edge in self.graph.outgoing(node.id):
@@ -1003,7 +1043,7 @@ class SemanticWorld:
                     "name": state.node.name,
                     "category": state.node.category,
                     "properties": list(state.node.properties),
-                    "states": list(state.node.states),
+                    "states": self._runtime_node_states(state),
                     "openable": state.node.is_openable,
                     "container": state.node.is_container,
                     "surface": state.node.is_surface,
@@ -1018,6 +1058,7 @@ class SemanticWorld:
                     "assembled": state.assembled,
                     "pressed": state.pressed,
                     "attached_to": state.attached_to,
+                    "inspected": state.inspected,
                     "part_of": state.node.metadata.get("part_of"),
                     "reachable": self.is_reachable(node_id),
                     "occludes_hidden_count": len(hidden_targets),
@@ -1045,6 +1086,12 @@ class SemanticWorld:
             "memory": copy.deepcopy(self.task.metadata.get("memory_episode")),
             "map_layout": self.map_layout(visible_node_ids),
         }
+
+    def _runtime_node_states(self, state: NodeState) -> list[str]:
+        states = [item for item in state.node.states if item not in {"OPEN", "CLOSED"}]
+        if state.node.is_openable:
+            states.append("OPEN" if state.open else "CLOSED")
+        return states
 
     def _hand_state(self, held_objects: list[dict[str, str]]) -> dict[str, Any]:
         capacity = self._hand_capacity()
@@ -1091,6 +1138,8 @@ class SemanticWorld:
         for source_id, target_id, relation in self.active_occlusion_edges:
             if source_id != container_id or relation not in OCCLUSION_RELATIONS:
                 continue
+            if self._occlusion_edge_resolution_action((source_id, target_id, relation)) != "open":
+                continue
             if target_id == container_id or target_id in exclude:
                 continue
             target = self.states.get(target_id)
@@ -1105,6 +1154,25 @@ class SemanticWorld:
         if state is None or not state.node.is_container or state.node.max_items is None:
             return False
         return self._container_item_count(container_id, exclude=exclude) >= state.node.max_items
+
+    def _carrier_payload_ids(self, carrier_id: str) -> list[str]:
+        payload_ids = []
+        for node_id, state in self.states.items():
+            if node_id == carrier_id or state.held:
+                continue
+            if state.location_target != carrier_id:
+                continue
+            if state.location_relation not in {"INSIDE", "ON"}:
+                continue
+            payload_ids.append(node_id)
+        return sorted(payload_ids)
+
+    def _is_on_surface(self, node_id: str) -> bool:
+        state = self.states.get(node_id)
+        if state is None or state.location_relation != "ON" or state.location_target is None:
+            return False
+        target = self.states.get(state.location_target)
+        return bool(target and target.node.is_surface)
 
     def _current_visible_edges(self, visible_node_ids: set[str]) -> list[dict[str, str]]:
         edges: list[dict[str, str]] = []
@@ -1238,7 +1306,12 @@ class SemanticWorld:
         self.active_occlusion_edges = {
             edge
             for edge in self.active_occlusion_edges
-            if edge[1] != node_id
+            if edge[0] != node_id and edge[1] != node_id
+        }
+        self.occlusion_edge_resolution_actions = {
+            edge: resolution_action
+            for edge, resolution_action in self.occlusion_edge_resolution_actions.items()
+            if edge in self.active_occlusion_edges
         }
 
     def _active_blockers(self, node_id: str, relations: set[str] | None = None) -> list[str]:
@@ -1250,28 +1323,49 @@ class SemanticWorld:
             source = self.states.get(source_id)
             if source is None:
                 continue
-            if relation in OCCLUSION_RELATIONS and not self._occlusion_source_active(source):
+            edge = (source_id, target_id, relation)
+            if relation in OCCLUSION_RELATIONS and not self._occlusion_edge_active(edge):
                 continue
             active.append(source.node.id)
         return active
 
-    def _occlusion_source_active(self, source: NodeState) -> bool:
-        if source.node.is_container:
+    def _occlusion_edge_resolution_action(self, edge: tuple[str, str, str]) -> str:
+        return self.occlusion_edge_resolution_actions.get(edge) or self._default_occlusion_resolution_action(edge[0])
+
+    def _occlusion_edge_active(self, edge: tuple[str, str, str]) -> bool:
+        source = self.states.get(edge[0])
+        if source is None:
+            return False
+        resolution_action = self._occlusion_edge_resolution_action(edge)
+        if resolution_action == "open":
             return not (source.node.is_openable and source.open)
-        return not source.moved_aside
+        if resolution_action == "move_aside":
+            return not source.moved_aside
+        return False
 
     def _inspect_reveals_occlusion(self, state: NodeState) -> bool:
         return state.node.has_property(*INSPECT_REVEAL_PROPERTIES)
 
     def _hidden_targets_blocked_by(self, source_id: str) -> list[str]:
-        source = self.states.get(source_id)
-        if source is None:
-            return []
-        if not self._occlusion_source_active(source):
-            return []
         hidden_targets = []
         for edge_source, edge_target, relation in sorted(self.active_occlusion_edges):
             if edge_source != source_id or relation not in OCCLUSION_RELATIONS:
+                continue
+            if not self._occlusion_edge_active((edge_source, edge_target, relation)):
+                continue
+            if edge_target in self.states and not self.is_visible(edge_target):
+                hidden_targets.append(edge_target)
+        return hidden_targets
+
+    def _hidden_targets_blocked_by_resolution(self, source_id: str, resolution_action: str) -> list[str]:
+        hidden_targets = []
+        for edge_source, edge_target, relation in sorted(self.active_occlusion_edges):
+            edge = (edge_source, edge_target, relation)
+            if edge_source != source_id or relation not in OCCLUSION_RELATIONS:
+                continue
+            if self._occlusion_edge_resolution_action(edge) != resolution_action:
+                continue
+            if not self._occlusion_edge_active(edge):
                 continue
             if edge_target in self.states and not self.is_visible(edge_target):
                 hidden_targets.append(edge_target)
@@ -1384,25 +1478,11 @@ class SemanticWorld:
         state = self.states.get(node_id)
         return bool(state and state.node.is_grabbable and state.node.is_movable)
 
-    def _common_part_location(self, part_ids: list[str]) -> tuple[str | None, str | None]:
-        locations = {
-            (self.states[part_id].location_relation, self.states[part_id].location_target)
-            for part_id in part_ids
-            if self.states[part_id].location_relation is not None
-        }
-        if len(locations) == 1:
-            return next(iter(locations))
-        return None, None
-
     def _set_parent_assembled(self, parent_id: str, part_ids: list[str]) -> None:
         parent_state = self.states.get(parent_id)
         if parent_state is None:
             return
         parent_state.assembled = True
-        relation, target = self._common_part_location(part_ids)
-        if relation is not None:
-            parent_state.location_relation = relation
-            parent_state.location_target = target
         for part_id in part_ids:
             self._clear_part_spatial_state(part_id)
 
@@ -1417,6 +1497,11 @@ class SemanticWorld:
             edge
             for edge in self.active_occlusion_edges
             if edge[0] != part_id and edge[1] != part_id
+        }
+        self.occlusion_edge_resolution_actions = {
+            edge: resolution_action
+            for edge, resolution_action in self.occlusion_edge_resolution_actions.items()
+            if edge in self.active_occlusion_edges
         }
 
     def attachment_matches(self, left_id: str, right_id: str) -> bool:
@@ -1482,6 +1567,8 @@ class SemanticWorld:
             return self._failure(action, "not_openable", f"{target.node.id} is not openable")
         if not self.is_visible(target.node.id):
             return self._failure(action, "not_visible", f"{target.node.id} is not visible")
+        if not self._is_on_surface(target.node.id):
+            return self._failure(action, "not_on_surface", f"{target.node.id} must be on a surface before opening")
         if any(state.held for state in self.states.values()):
             return self._failure(action, "hands_occupied", f"{target.node.id} needs both hands free to open")
         target.open = True
@@ -1523,6 +1610,16 @@ class SemanticWorld:
             return self._failure(action, "not_grabbable", f"{target.node.id} is not grabbable and movable")
         if not self.is_reachable(target.node.id):
             return self._failure(action, "not_reachable", f"{target.node.id} is not reachable")
+        payload_ids = self._carrier_payload_ids(target.node.id)
+        can_carry_contents = target.node.has_property("CARRY_CONTENTS", "STABLE_TRANSPORT")
+        if payload_ids and not can_carry_contents:
+            return self._failure(
+                action,
+                "non_empty_payload",
+                f"{target.node.id} cannot be grabbed while carrying other objects",
+                payload_ids=payload_ids,
+                payload_count=len(payload_ids),
+            )
         if target.location_relation is not None or target.location_target is not None:
             self._remove_occlusions_for_location_change(target.node.id)
         target.held = True
@@ -1680,7 +1777,7 @@ class SemanticWorld:
             return self._failure(action, "missing_target", "blocker resolution needs a known target")
         if not self.is_visible(target.node.id):
             return self._failure(action, "not_visible", f"{target.node.id} is not visible")
-        if moved_aside and target.node.is_container and self._hidden_targets_blocked_by(target.node.id):
+        if moved_aside and self._hidden_targets_blocked_by_resolution(target.node.id, "open"):
             return self._failure(action, "requires_open", f"{target.node.id} is a container occluder and must be opened")
         if moved_aside and not target.node.is_movable:
             return self._failure(action, "not_movable", f"{target.node.id} is not movable")
@@ -2142,34 +2239,81 @@ class TrajectoryEvaluator:
         }
 
     def _failure_metrics(self) -> dict[str, Any]:
-        first_failure_index = None
-        failed_action = None
-        failed_nodes: list[str] = []
-        for index, item in enumerate(self.world.events):
-            if item["event"].get("status") != "failure":
-                continue
-            first_failure_index = index
-            failed_action = item["event"].get("failed_action") or item["action"].get("base_name")
-            failed_nodes = list(item["action"].get("node_ids", []))
-            break
-        recovered = False
-        retried = False
-        if first_failure_index is not None:
-            for item in self.world.events[first_failure_index + 1 :]:
+        failures = [
+            (index, item)
+            for index, item in enumerate(self.world.events)
+            if item["event"].get("status") == "failure"
+        ]
+        execution_failures = [
+            (index, item)
+            for index, item in failures
+            if item["event"].get("injected") is True or item["event"].get("failure_type") == "injected"
+        ]
+        semantic_failures = [
+            (index, item)
+            for index, item in failures
+            if not (item["event"].get("injected") is True or item["event"].get("failure_type") == "injected")
+        ]
+
+        execution_recovered = False
+        execution_retried = False
+        if execution_failures:
+            first_execution_index, first_execution_failure = execution_failures[0]
+            failed_action = first_execution_failure["event"].get("failed_action") or first_execution_failure[
+                "action"
+            ].get("base_name")
+            failed_nodes = list(first_execution_failure["action"].get("node_ids", []))
+            for item in self.world.events[first_execution_index + 1 :]:
                 if item["event"].get("status") == "success" and item["action"].get("base_name") == "recover":
-                    recovered = True
+                    execution_recovered = True
                 if (
                     item["event"].get("status") == "success"
                     and failed_action
                     and item["action"].get("base_name") == failed_action
                     and item["action"].get("node_ids") == failed_nodes
                 ):
-                    retried = True
-                    recovered = True
+                    execution_retried = True
+                    execution_recovered = True
+
+        semantic_replanned = False
+        if semantic_failures:
+            first_semantic_index, first_semantic_failure = semantic_failures[0]
+            failed_signature = (
+                first_semantic_failure["action"].get("base_name"),
+                tuple(first_semantic_failure["action"].get("node_ids", [])),
+            )
+            semantic_replanned = any(
+                item["event"].get("status") == "success"
+                and item["action"].get("base_name") not in {"recover", "stop"}
+                and (
+                    item["action"].get("base_name"),
+                    tuple(item["action"].get("node_ids", [])),
+                )
+                != failed_signature
+                for item in self.world.events[first_semantic_index + 1 :]
+            )
+
+        failure_types = [
+            str(item["event"].get("failure_type"))
+            for _, item in semantic_failures
+            if item["event"].get("failure_type") is not None
+        ]
         return {
-            "failure_observed": first_failure_index is not None,
-            "recovered_after_failure": recovered,
-            "retried_failed_action": retried,
+            "failure_observed": bool(failures),
+            "recovered_after_failure": execution_recovered or semantic_replanned,
+            "retried_failed_action": execution_retried,
+            "execution": {
+                "failure_observed": bool(execution_failures),
+                "failure_count": len(execution_failures),
+                "recovered_after_failure": execution_recovered,
+                "retried_failed_action": execution_retried,
+            },
+            "semantic": {
+                "failure_observed": bool(semantic_failures),
+                "failure_count": len(semantic_failures),
+                "failure_types": list(dict.fromkeys(failure_types)),
+                "replanned_after_failure": semantic_replanned,
+            },
         }
 
 

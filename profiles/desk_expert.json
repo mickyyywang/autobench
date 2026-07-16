@@ -1,9 +1,0 @@
-{
-  "profile_id": "desk_expert",
-  "spatial": {
-    "enabled": true,
-    "num_occluded_objects": 4,
-    "occlusion_depth": 3,
-    "num_decomposed_parents": 2
-  }
-}

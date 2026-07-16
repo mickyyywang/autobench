@@ -1,5 +1,0 @@
-{
-  "nonexistent_edges": [
-    {"from": "*", "to": "化妆品收纳袋", "relation": "OCCLUDES"}
-  ]
-}

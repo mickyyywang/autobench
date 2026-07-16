@@ -8,17 +8,17 @@
     "大碗": {
       "name": "大碗",
       "category": "container",
-      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "OCCLUDER"]
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "OCCLUDER", "CARRY_CONTENTS"]
     },
     "中碗": {
       "name": "中碗",
       "category": "container",
-      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS"]
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "CARRY_CONTENTS"]
     },
     "小碗": {
       "name": "小碗",
       "category": "container",
-      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS"]
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "CARRY_CONTENTS"]
     },
     "蘸碟": {
       "name": "蘸碟",
@@ -28,7 +28,7 @@
     "盘子": {
       "name": "盘子",
       "category": "surface",
-      "properties": ["GRABBABLE", "MOVABLE", "SURFACES", "CONTAINERS"]
+      "properties": ["GRABBABLE", "MOVABLE", "SURFACES"]
     },
     "勺子": {
       "name": "勺子",
@@ -43,7 +43,7 @@
     "托盘": {
       "name": "托盘",
       "category": "surface",
-      "properties": ["GRABBABLE", "MOVABLE", "SURFACES"]
+      "properties": ["SURFACES", "STATIC"]
     },
     "筷子收纳架": {
       "name": "筷子收纳架",
@@ -77,8 +77,7 @@
     "菜篮": {
       "name": "菜篮",
       "category": "container",
-      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "CAN_OPEN", "OCCLUDER", "SURFACES"],
-      "states": ["OPEN"]
+      "properties": ["GRABBABLE", "MOVABLE", "CONTAINERS", "OCCLUDER"]
     }
   }
 }

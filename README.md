@@ -216,7 +216,7 @@ Detailed relation and property guidance is kept in small prompt skill files:
 
 The API prompt describes these fields as follows:
 
-- `GRABBABLE` and `MOVABLE`: allow a material to become a grasped/moved task object.
+- `GRABBABLE` and `MOVABLE`: allow a material to become a grasped/moved task object. A movable container or surface with an `INSIDE`/`ON` payload rejects `grab` with `non_empty_payload` unless it also has `CARRY_CONTENTS` (or the compatible alias `STABLE_TRANSPORT`).
 - `SURFACES`: allows a material to become an `ON` placement target. It can be combined with `STORAGE_UNIT` on a drawer parent when the drawer top/body can support objects.
 - `CONTAINERS`: allows a material to become a future containment/placement target. Initial `create-task-view-graph` output does not keep `INSIDE` edges.
 - `CAN_OPEN` plus `states` such as `["OPEN"]` or `["CLOSED"]`: makes the planner emit open/close actions when placing into that target.
@@ -364,6 +364,34 @@ PYTHONPATH=auto_embodied_task/src python -m auto_embodied_task serve-trajectory 
 ```
 
 Harness internals, supported action names, observation shape, failure injection behavior, and evaluator details should be checked directly in code, primarily `src/auto_embodied_task/harness.py`, `src/auto_embodied_task/harness_bp.py`, and `src/auto_embodied_task/goal.py`.
+
+## Real Trajectory Evaluation with MR Models
+
+`evaluate-real-trajectories` supports the internal MR multimodal gateways described by the examples in `/home/wmq/project/mr_model`. Set `MR_API_KEY`, select an `mr_*` provider, and pass the exact model name:
+
+```bash
+export MR_API_KEY=...
+PYTHONPATH=src python -m auto_embodied_task evaluate-real-trajectories \
+  --input saved/aligned_trajectory.jsonl \
+  --output evaluations/real_eval_gpt55.jsonl \
+  --provider mr_openai \
+  --model gpt-5.5 \
+  --modes obs_only \
+  --history-source inference \
+  --frame-sampling previous_tail
+```
+
+The MR providers are:
+
+- `mr_openai`: `gpt-5.5`, `gpt-5.5-pro-2026-04-23`, `gpt-5.4-2026-03-05`, `gpt-5-2025-08-07`.
+- `mr_anthropic`: `claude-opus-4-8`, `claude-fable-5`, `claude-sonnet-5`, `claude-opus-4-7`, `claude-sonnet-4-6-20260217`, `claude-opus-4-6-20260205`.
+- `mr_google`: `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3.5-flash`, `gemini-3.1-flash-lite-preview`, `gemini-3-flash-preview`.
+
+The provider selects the correct MR URL, authentication header, image payload, and response parser automatically. `--api-base-url` remains available for overriding a gateway. Image- and video-generation models are not action-evaluation models and are intentionally excluded. The Gemini Robotics entry is also excluded because its calling protocol is not documented in the supplied examples.
+
+Every evaluation run appends a local timestamp to the requested output basename, for example `real_eval_gpt55_20260715_164530.jsonl`. Its summary uses the same basename with `__summary.json`, so repeated runs do not overwrite one another.
+
+With `--frame-sampling previous_tail`, an unmatched `manual_inserted` step can be evaluated from the nearest preceding matched/custom observation tail. Its own custom observation tail remains the input observation for the following step. The evaluator preserves graph-generated `valid_actions` and, when necessary, appends the manual gold action instead of changing the global post-recovery retry rule. Evaluation records expose the two sources separately as `generated_valid_actions` and `valid_actions_added`.
 
 ## Extending Settings
 

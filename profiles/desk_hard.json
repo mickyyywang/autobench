@@ -1,9 +1,0 @@
-{
-  "profile_id": "desk_hard",
-  "spatial": {
-    "enabled": true,
-    "num_occluded_objects": 3,
-    "occlusion_depth": 2,
-    "num_decomposed_parents": 1
-  }
-}

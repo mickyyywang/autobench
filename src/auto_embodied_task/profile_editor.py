@@ -439,7 +439,10 @@ class _ProfileEditor:
                     continue
                 if not self._allows_edge(node_id, current_target_id, "OCCLUDES"):
                     continue
-                if not self._container_has_capacity_for(node_id, current_target_id):
+                if self._occlusion_resolution_action(self._node(node_id)) == "open" and not self._container_has_capacity_for(
+                    node_id,
+                    current_target_id,
+                ):
                     continue
                 selected.append(node_id)
                 blocked.update(self._part_conflict_set(node_id))
@@ -608,15 +611,15 @@ class _ProfileEditor:
 
     def _add_spatial_occlusion_layer(self, occluder_id: str, target_id: str) -> dict[str, Any]:
         occluder = self._node(occluder_id)
-        if not self._can_occlude(occluder):
+        resolution_action = self._occlusion_resolution_action(occluder)
+        if resolution_action is None:
             raise ValueError(f"node {occluder_id!r} cannot occlude because it lacks an occlusion affordance")
         if not self._can_be_occlusion_target(target_id):
             raise ValueError(f"node {target_id!r} cannot be an occlusion target")
         if not self._allows_edge(occluder_id, target_id, "OCCLUDES"):
             raise ValueError(f"OCCLUDES from {occluder_id!r} to {target_id!r} is disallowed")
-        if not self._container_has_capacity_for(occluder_id, target_id):
+        if resolution_action == "open" and not self._container_has_capacity_for(occluder_id, target_id):
             raise ValueError(f"container {occluder_id!r} is at max_items capacity")
-        resolution_action = "open" if self._is_container(occluder) else "move_aside"
         if resolution_action == "open":
             self._ensure_closed_container_state(occluder_id)
         removed = self._remove_incoming_occlusion_edges(target_id)
@@ -1023,6 +1026,8 @@ class _ProfileEditor:
                 continue
             source = str(edge.get("from", edge.get("source")))
             target = str(edge.get("to", edge.get("target")))
+            if source == container_id and self._occlusion_resolution_action(self._node(source)) != "open":
+                continue
             if source == container_id and target != container_id and target not in exclude:
                 items.add(target)
         return len(items)
@@ -1100,6 +1105,8 @@ class _ProfileEditor:
         normalized = [_normalize(item) for item in states]
         if "CLOSED" in normalized:
             return
+        if "OPEN" in normalized:
+            raise ValueError(f"node {node_id!r} is explicitly OPEN and cannot be used as an open-resolved occluder")
         states[:] = [state for state in states if _normalize(state) != "OPEN"]
         states.append("CLOSED")
         self.edits.append({"type": "set_state", "node": node_id, "state": "CLOSED"})
@@ -1141,13 +1148,22 @@ class _ProfileEditor:
         return self._has_property(node, "CONTAINERS") or category in {"container", "receptacle"}
 
     def _can_occlude(self, node: dict[str, Any]) -> bool:
+        return self._occlusion_resolution_action(node) is not None
+
+    def _occlusion_resolution_action(self, node: dict[str, Any]) -> str | None:
         if self._is_room(node) or self._is_surface(node):
-            return False
+            return None
         if not self._has_property(node, "OCCLUDER"):
-            return False
+            return None
         if self._is_container(node):
-            return self._is_openable(node)
-        return self._has_property(node, "MOVABLE")
+            if self._is_openable(node) and self._is_closed_container(node):
+                return "open"
+            if self._has_property(node, "MOVABLE"):
+                return "move_aside"
+            return None
+        if self._has_property(node, "MOVABLE"):
+            return "move_aside"
+        return None
 
     def _is_openable(self, node: dict[str, Any]) -> bool:
         states = {_normalize(state) for state in node.get("states", [])}

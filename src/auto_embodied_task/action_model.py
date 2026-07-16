@@ -117,6 +117,7 @@ ACTION_SCHEMAS: dict[str, ActionSchema] = {
             SymbolicCondition("GRABBABLE", ("object",)),
             SymbolicCondition("MOVABLE", ("object",)),
             SymbolicCondition("REACHABLE", ("object",)),
+            SymbolicCondition("EMPTY_OR_CARRY_CONTENTS", ("object",)),
         ),
         effects=(
             SymbolicEffect("HELD", ("object",)),
@@ -132,6 +133,7 @@ ACTION_SCHEMAS: dict[str, ActionSchema] = {
             SymbolicCondition("GRABBABLE", ("object",)),
             SymbolicCondition("MOVABLE", ("object",)),
             SymbolicCondition("REACHABLE", ("object",)),
+            SymbolicCondition("EMPTY_OR_CARRY_CONTENTS", ("object",)),
         ),
         effects=(
             SymbolicEffect("HELD", ("object",)),
