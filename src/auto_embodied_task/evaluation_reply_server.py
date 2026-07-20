@@ -82,7 +82,8 @@ def evaluation_sources(root: str | Path) -> list[dict[str, Any]]:
     if not directory.exists():
         return []
     sources: list[dict[str, Any]] = []
-    for path in sorted(directory.glob("*.jsonl")):
+    paths = [*directory.glob("*.jsonl"), *(directory / "closed_loop").glob("*.jsonl")]
+    for path in sorted(paths):
         if not path.is_file() or path.stat().st_size == 0:
             continue
         try:
@@ -92,16 +93,30 @@ def evaluation_sources(root: str | Path) -> list[dict[str, Any]]:
             summary_path = summary_path_for(path)
             summary = load_evaluation_summary(summary_path)
             model_name = infer_model_name(path, summary=summary, records=records)
+            evaluation_type = str(
+                (summary or {}).get("evaluation_type")
+                or records[0].get("evaluation_type")
+                or "open_loop_real"
+            )
             episode_ids = sorted({str(record.get("episode_id") or "") for record in records})
             modes = sorted({str(record.get("mode") or "") for record in records})
+            condition_ids = sorted(
+                {
+                    str(record.get("condition_id") or "")
+                    for record in records
+                    if record.get("condition_id")
+                }
+            )
             sources.append(
                 {
                     "path": path,
-                    "name": path.name,
+                    "name": str(path.relative_to(directory)),
                     "model_name": model_name,
+                    "evaluation_type": evaluation_type,
                     "record_count": len(records),
                     "episode_ids": [value for value in episode_ids if value],
                     "modes": [value for value in modes if value],
+                    "condition_ids": condition_ids,
                     "summary_path": summary_path,
                     "has_summary": summary is not None,
                     "mtime": path.stat().st_mtime,
@@ -120,8 +135,12 @@ def evaluation_catalog(root: str | Path) -> dict[str, Any]:
         "source_count": len(sources),
         "record_count": sum(int(source["record_count"]) for source in sources),
         "model_names": sorted({str(source["model_name"]) for source in sources}),
+        "evaluation_types": sorted({str(source["evaluation_type"]) for source in sources}),
         "episode_ids": sorted({value for source in sources for value in source["episode_ids"]}),
         "modes": sorted({value for source in sources for value in source["modes"]}),
+        "condition_ids": sorted(
+            {value for source in sources for value in source["condition_ids"]}
+        ),
         "sources": [
             {
                 key: value
@@ -147,6 +166,8 @@ def _ratio(numerator: int, denominator: int) -> float | None:
 
 
 def _aggregate_record_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if any(record.get("evaluation_type") == "closed_loop_visible_graph" for record in records):
+        return _aggregate_closed_loop_record_metrics(records)
     scores = [record["score"] for record in records if isinstance(record.get("score"), dict)]
     recovery_scores = [
         record["recovery_score"]
@@ -158,8 +179,11 @@ def _aggregate_record_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
     failed_action_scores = [
         score for score in recovery_scores if score.get("failed_action_applicable")
     ]
+    grounding_scores = [
+        score for score in recovery_scores if score.get("failed_node_ids_applicable")
+    ]
     paired_scores = list(zip(scores, recovery_scores))
-    return {
+    teacher_imitation = {
         "record_count": len(records),
         "scored_count": len(scores),
         "model_error_count": sum(record.get("model_error") is not None for record in records),
@@ -188,6 +212,10 @@ def _aggregate_record_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             sum(bool(score.get("failed_action")) for score in failed_action_scores),
             len(failed_action_scores),
         ),
+        "recovery_grounding_accuracy": _ratio(
+            sum(bool(score.get("grounding_exact")) for score in grounding_scores),
+            len(grounding_scores),
+        ),
         "recovery_exact_accuracy": _ratio(
             sum(bool(score.get("full_exact")) for score in recovery_scores), len(recovery_scores)
         ),
@@ -199,6 +227,102 @@ def _aggregate_record_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             len(paired_scores),
         ),
     }
+    from .real_observation_eval import _aggregate_capability_scores
+
+    capabilities = _aggregate_capability_scores(records)
+    primary_metrics = {
+        metric: value
+        for dimension in (
+            "action_selection",
+            "failure_recovery",
+            "active_exploration",
+            "completion_judgment",
+        )
+        for metric, value in capabilities[dimension].items()
+    }
+    return {
+        **teacher_imitation,
+        **primary_metrics,
+        "teacher_imitation": teacher_imitation,
+        "capabilities": capabilities,
+    }
+
+
+def _aggregate_closed_loop_record_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    from .real_observation_eval import _aggregate_capability_scores
+
+    capabilities = _aggregate_capability_scores(records)
+    outcomes = [
+        record["rollout_outcome"]
+        for record in records
+        if isinstance(record.get("rollout_outcome"), dict)
+    ]
+
+    def mean(values: list[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
+    capabilities["completion_judgment"] = {
+        "premature_stop_rate": mean([float(item.get("premature_stop", False)) for item in outcomes]),
+        "completion_stop_recall": mean(
+            [
+                float(item.get("completion_stop_success", False))
+                for item in outcomes
+                if item.get("goal_ever_satisfied") is True
+            ]
+        ),
+    }
+    executable = [
+        float(record["normally_executable"])
+        for record in records
+        if record.get("normally_executable") is not None
+    ]
+    outcome_metrics = {
+        "task_success_rate": mean([float(item.get("success", False)) for item in outcomes]),
+        "goal_ever_satisfied_rate": mean(
+            [float(item.get("goal_ever_satisfied", False)) for item in outcomes]
+        ),
+        "final_goal_satisfied_rate": mean(
+            [float(item.get("final_goal_satisfied", False)) for item in outcomes]
+        ),
+        "normalized_goal_progress": mean(
+            [float(item.get("normalized_goal_progress", 0.0)) for item in outcomes]
+        ),
+        "teacher_normalized_efficiency": mean(
+            [float(item.get("teacher_normalized_efficiency", 0.0)) for item in outcomes]
+        ),
+        "action_executability_rate": mean(executable),
+        "average_step_count": mean([float(item.get("step_count", 0)) for item in outcomes]),
+        "episodes_with_injected_failure_rate": mean(
+            [float(item.get("failure_injected", False)) for item in outcomes]
+        ),
+        "average_injected_failure_count": mean(
+            [float(item.get("injected_failure_count", 0)) for item in outcomes]
+        ),
+        "episodes_with_disturbance_rate": mean(
+            [float(item.get("disturbance_applied", False)) for item in outcomes]
+        ),
+        "average_disturbance_count": mean(
+            [float(item.get("disturbance_count", 0)) for item in outcomes]
+        ),
+    }
+    primary_metrics = {
+        metric: value
+        for dimension in (
+            "action_selection",
+            "failure_recovery",
+            "active_exploration",
+            "completion_judgment",
+        )
+        for metric, value in capabilities[dimension].items()
+    }
+    return {
+        **outcome_metrics,
+        **primary_metrics,
+        "record_count": len(records),
+        "model_error_count": sum(record.get("model_error") is not None for record in records),
+        "outcomes": outcome_metrics,
+        "capabilities": capabilities,
+    }
 
 
 def evaluation_reply_payload(
@@ -208,6 +332,8 @@ def evaluation_reply_payload(
     model_names: list[str] | tuple[str, ...] | None = None,
     episode_id: str | None = None,
     mode: str | None = None,
+    evaluation_type: str | None = None,
+    condition_id: str | None = None,
     base_path: str = "",
 ) -> dict[str, Any]:
     base_path = normalize_base_path(base_path)
@@ -218,6 +344,9 @@ def evaluation_reply_payload(
     summaries: list[dict[str, Any]] = []
     metric_groups: list[dict[str, Any]] = []
     for source in evaluation_sources(root):
+        source_evaluation_type = str(source.get("evaluation_type") or "open_loop_real")
+        if evaluation_type and source_evaluation_type != evaluation_type:
+            continue
         source_model = str(source["model_name"])
         if selected_models and source_model not in selected_models:
             continue
@@ -231,8 +360,13 @@ def evaluation_reply_payload(
                 continue
             if mode and str(record.get("mode") or "") != mode:
                 continue
+            if condition_id and str(record.get("condition_id") or "") != condition_id:
+                continue
             item = dict(record)
             item["model_name"] = record_model
+            item["evaluation_type"] = str(
+                item.get("evaluation_type") or source_evaluation_type
+            )
             item["result_file"] = source["name"]
             frame_files = list((item.get("request_summary") or {}).get("frame_files") or [])
             item["image_urls"] = [
@@ -260,23 +394,36 @@ def evaluation_reply_payload(
                     str(record.get("episode_id") or ""),
                     str(record.get("model_name") or source_model),
                     str(record.get("mode") or ""),
+                    str(record.get("evaluation_type") or source_evaluation_type),
+                    str(record.get("condition_id") or ""),
                 )
                 for record in filtered_source_records
             }
         )
-        for group_episode, group_model, group_mode in metric_keys:
+        for (
+            group_episode,
+            group_model,
+            group_mode,
+            group_evaluation_type,
+            group_condition,
+        ) in metric_keys:
             group_records = [
                 record
                 for record in filtered_source_records
                 if str(record.get("episode_id") or "") == group_episode
                 and str(record.get("model_name") or source_model) == group_model
                 and str(record.get("mode") or "") == group_mode
+                and str(record.get("evaluation_type") or source_evaluation_type)
+                == group_evaluation_type
+                and str(record.get("condition_id") or "") == group_condition
             ]
             metric_groups.append(
                 {
                     "episode_id": group_episode,
                     "model_name": group_model,
                     "mode": group_mode,
+                    "evaluation_type": group_evaluation_type,
+                    "condition_id": group_condition or None,
                     "result_file": source["name"],
                     "metrics": _aggregate_record_metrics(group_records),
                     "config": {
@@ -286,6 +433,13 @@ def evaluation_reply_payload(
                             "frames_per_camera",
                             "frame_sampling",
                             "includes_valid_actions",
+                            "failure_injection",
+                            "failure_injection_config",
+                            "graph_disturbance_file",
+                            "graph_disturbance_count",
+                            "max_steps",
+                            "condition_id",
+                            "intervention_type",
                         )
                     },
                 }
@@ -297,6 +451,7 @@ def evaluation_reply_payload(
             int(record.get("step") or 0),
             str(record.get("model_name") or ""),
             str(record.get("mode") or ""),
+            str(record.get("condition_id") or ""),
         )
     )
     return {
@@ -304,6 +459,8 @@ def evaluation_reply_payload(
             "model_names": sorted(selected_models),
             "episode_id": episode_id,
             "mode": mode,
+            "evaluation_type": evaluation_type,
+            "condition_id": condition_id,
         },
         "record_count": len(records),
         "records": records,
@@ -314,6 +471,8 @@ def evaluation_reply_payload(
                 str(item["episode_id"]),
                 str(item["model_name"]),
                 str(item["mode"]),
+                str(item.get("evaluation_type") or ""),
+                str(item.get("condition_id") or ""),
                 str(item["result_file"]),
             ),
         ),
@@ -403,6 +562,8 @@ def create_evaluation_reply_app(
         model_names: str | None = None,
         episode_id: str | None = None,
         mode: str | None = None,
+        evaluation_type: str | None = None,
+        condition_id: str | None = None,
     ) -> dict[str, Any]:
         try:
             return evaluation_reply_payload(
@@ -411,6 +572,8 @@ def create_evaluation_reply_app(
                 model_names=[value for value in (model_names or "").split(",") if value],
                 episode_id=episode_id or None,
                 mode=mode or None,
+                evaluation_type=evaluation_type or None,
+                condition_id=condition_id or None,
                 base_path=base_path,
             )
         except Exception as exc:
@@ -481,13 +644,13 @@ def _render_evaluation_reply_html(*, base_path: str = "") -> str:
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,select,input{font:inherit}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #8298dc;outline-offset:1px}
 .topbar{height:54px;background:var(--surface);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 22px;position:sticky;top:0;z-index:20}.brand{font-weight:720;font-size:17px}.brand small{font-weight:500;color:var(--muted);margin-left:10px}.top-actions{display:flex;gap:8px;align-items:center}.count{font:12px var(--mono);color:var(--muted)}
 .btn{height:34px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);padding:0 13px;border-radius:5px;cursor:pointer}.btn:hover{border-color:var(--accent);color:var(--accent)}.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.btn:disabled{opacity:.5;cursor:not-allowed}
-.filters{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 22px;display:grid;grid-template-columns:minmax(220px,1.2fr) minmax(180px,1fr) minmax(150px,.8fr) auto;gap:12px;align-items:end;position:sticky;top:54px;z-index:19}.field label{display:block;font-size:12px;font-weight:650;color:var(--muted);margin-bottom:5px}.field select{height:36px;width:100%;border:1px solid var(--border-strong);border-radius:5px;background:#fff;padding:0 32px 0 10px;color:var(--text)}.filter-status{height:36px;display:flex;align-items:center;white-space:nowrap;color:var(--muted);font:12px var(--mono)}
+.filters{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 22px;display:grid;grid-template-columns:minmax(220px,1.2fr) minmax(170px,1fr) minmax(160px,.9fr) minmax(150px,.8fr) minmax(190px,1fr) auto;gap:12px;align-items:end;position:sticky;top:54px;z-index:19}.field label{display:block;font-size:12px;font-weight:650;color:var(--muted);margin-bottom:5px}.field select{height:36px;width:100%;border:1px solid var(--border-strong);border-radius:5px;background:#fff;padding:0 32px 0 10px;color:var(--text)}.filter-status{height:36px;display:flex;align-items:center;white-space:nowrap;color:var(--muted);font:12px var(--mono)}
 .model-picker{position:relative}.model-trigger{height:36px;width:100%;border:1px solid var(--border-strong);border-radius:5px;background:#fff;padding:0 10px;display:flex;align-items:center;justify-content:space-between;gap:10px;cursor:pointer;text-align:left}.model-trigger::after{content:"▾";color:var(--muted)}.model-menu{display:none;position:absolute;left:0;right:0;top:41px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;box-shadow:0 12px 28px rgba(29,37,52,.16);z-index:40;max-height:280px;overflow:auto}.model-menu.open{display:block}.model-menu-actions{display:flex;gap:6px;padding:8px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--surface)}.model-menu-actions button{border:0;background:transparent;color:var(--accent);font-size:12px;cursor:pointer;padding:3px 5px}.model-option{display:flex;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;font:12px var(--mono)}.model-option:hover{background:var(--surface-2)}.model-option input{width:15px;height:15px;accent-color:var(--accent)}
 .main{max-width:1560px;margin:0 auto;padding:18px 22px 40px}.notice{display:none;border:1px solid var(--border);background:var(--surface);padding:12px 14px;margin-bottom:14px;border-radius:var(--radius)}.notice.error{display:block;color:var(--red);background:var(--red-bg);border-color:#f4b8bd}.empty{padding:64px 20px;text-align:center;color:var(--muted);background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
 .records{display:flex;flex-direction:column;gap:10px}.record{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}.record.has-error{border-left:3px solid var(--red)}.record-head{min-height:42px;background:#fafbfc;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;padding:7px 11px}.step{font:700 13px var(--mono);min-width:62px}.tag{font:11px var(--mono);padding:2px 6px;border-radius:4px;background:var(--surface-2);color:var(--muted);border:1px solid var(--border)}.tag.good{color:var(--green);background:var(--green-bg);border-color:#b8dfca}.tag.bad{color:var(--red);background:var(--red-bg);border-color:#f1bdc1}.record-file{color:var(--muted);font:10px/1.4 var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
 .record-body{display:grid;grid-template-columns:minmax(270px,350px) minmax(0,1fr);min-height:250px}.visuals{padding:12px}.results-pane{min-width:0;border-left:1px solid var(--border);background:#fafbfc}.model-results-scroll{width:100%;overflow-x:scroll;overflow-y:hidden;padding:12px 12px 14px;scrollbar-gutter:stable;scrollbar-color:#8793a7 #e4e7ed;scrollbar-width:auto}.model-results-scroll::-webkit-scrollbar{height:12px}.model-results-scroll::-webkit-scrollbar-track{background:#e4e7ed;border-radius:8px}.model-results-scroll::-webkit-scrollbar-thumb{background:#8793a7;border:2px solid #e4e7ed;border-radius:8px}.model-results-scroll::-webkit-scrollbar-thumb:hover{background:#66758d}.model-results{display:flex;align-items:stretch;gap:10px;width:max-content;min-width:100%;padding-bottom:2px}.model-result{width:360px;min-width:360px;background:var(--surface);border:1px solid var(--border);border-radius:5px;overflow:hidden;display:flex;flex-direction:column}.model-result.error{border-color:#efb5ba}.model-result-head{min-height:44px;padding:8px 10px;background:var(--surface-2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px;flex-wrap:wrap}.model-name{font:700 12px var(--mono);margin-right:auto;overflow-wrap:anywhere}.model-result-body{display:flex;flex-direction:column;flex:1}.reason,.decision{padding:11px}.decision{border-top:1px solid var(--border);margin-top:auto}.section-label{font-size:11px;text-transform:uppercase;font-weight:750;color:var(--muted);margin-bottom:8px}.image-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.frame{margin:0;background:#111;aspect-ratio:16/9;overflow:hidden;border-radius:4px;border:1px solid #cfd4dc;cursor:zoom-in}.frame img{width:100%;height:100%;object-fit:contain;display:block}.frame.broken{background:var(--surface-2);display:grid;place-items:center;color:var(--muted);font-size:12px}.frame-meta{margin-top:8px;color:var(--muted);font:11px/1.5 var(--mono)}.reason-text{white-space:pre-wrap;overflow-wrap:anywhere;color:#303641}.error-text{margin-top:10px;padding:8px;background:var(--red-bg);color:var(--red);border-radius:4px;font:12px var(--mono)}
 .compare{display:grid;grid-template-columns:74px minmax(0,1fr);gap:7px 9px;align-items:start;margin-bottom:13px}.compare dt{color:var(--muted);font-size:12px}.compare dd{margin:0;font:12px/1.55 var(--mono);overflow-wrap:anywhere}.action-match{color:var(--green)}.action-miss{color:var(--red)}.recovery-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.recovery-pill{padding:2px 6px;border-radius:4px;font:11px var(--mono);background:var(--surface-2);border:1px solid var(--border)}.recovery-pill.yes{background:var(--amber-bg);color:var(--amber);border-color:#edcf98}.recovery-pill.no{background:var(--green-bg);color:var(--green);border-color:#b8dfca}
-.metrics{margin-top:22px;padding-top:18px;border-top:2px solid var(--border-strong)}.metrics-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:10px}.metrics h2{font-size:16px;margin:0}.metrics-context{color:var(--muted);font:12px var(--mono)}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:10px}.metric-chart{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px;min-width:0}.metric-chart h3{font-size:13px;margin:0 0 11px}.metric-bars{display:flex;flex-direction:column;gap:10px}.metric-episode{display:flex;flex-direction:column;gap:6px;padding-top:9px;border-top:1px solid var(--border)}.metric-episode:first-child{padding-top:0;border-top:0}.metric-episode-name{font:700 11px var(--mono);color:var(--text);overflow-wrap:anywhere}.metric-bar-row{display:grid;grid-template-columns:minmax(120px,170px) minmax(90px,1fr) 54px;gap:8px;align-items:center}.metric-series{font:11px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar-track{height:10px;background:var(--surface-2);border-radius:3px;overflow:hidden}.bar-fill{height:100%;width:var(--bar-width);background:var(--bar-color);border-radius:3px;min-width:0}.metric-value{text-align:right;font:11px var(--mono)}.metric-config{margin-top:10px;color:var(--muted);font:11px/1.6 var(--mono)}
+.metrics{margin-top:22px;padding-top:18px;border-top:2px solid var(--border-strong)}.metrics-head{display:flex;justify-content:space-between;align-items:end;margin-bottom:10px}.metrics h2{font-size:16px;margin:0}.metrics-context{color:var(--muted);font:12px var(--mono)}.metric-facet{margin-top:20px}.metric-facet:first-child{margin-top:0}.metric-facet-title{font:700 14px var(--mono);margin:0 0 10px}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:10px}.metric-chart{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px;min-width:0}.metric-chart h3{font-size:13px;margin:0 0 11px}.metric-bars{display:flex;flex-direction:column;gap:10px}.metric-episode{display:flex;flex-direction:column;gap:6px;padding-top:9px;border-top:1px solid var(--border)}.metric-episode:first-child{padding-top:0;border-top:0}.metric-episode-name{font:700 11px var(--mono);color:var(--text);overflow-wrap:anywhere}.metric-bar-row{display:grid;grid-template-columns:minmax(120px,170px) minmax(90px,1fr) 54px;gap:8px;align-items:center}.metric-series{font:11px var(--mono);color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar-track{height:10px;background:var(--surface-2);border-radius:3px;overflow:hidden}.bar-fill{height:100%;width:var(--bar-width);background:var(--bar-color);border-radius:3px;min-width:0}.metric-value{text-align:right;font:11px var(--mono)}.metric-config{margin-top:10px;color:var(--muted);font:11px/1.6 var(--mono)}
 dialog{border:0;border-radius:7px;padding:0;box-shadow:0 20px 60px rgba(20,28,45,.25);max-width:min(560px,calc(100vw - 28px));width:100%}dialog::backdrop{background:rgba(24,30,42,.46)}.dialog-head{padding:15px 18px;border-bottom:1px solid var(--border);font-weight:700;display:flex;justify-content:space-between}.dialog-body{padding:18px}.dialog-field{margin-bottom:14px}.dialog-field label{display:block;font-size:12px;font-weight:650;margin-bottom:5px}.dialog-field input{width:100%;border:1px solid var(--border-strong);padding:8px;border-radius:5px}.dialog-actions{display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--border)}.image-dialog{max-width:min(1100px,calc(100vw - 30px));background:#111}.image-dialog img{display:block;width:100%;max-height:88vh;object-fit:contain}.image-close{position:absolute;right:10px;top:10px;background:rgba(0,0,0,.62);color:#fff;border-color:#777}
 @media(max-width:980px){.record-body{grid-template-columns:minmax(240px,300px) minmax(0,1fr)}.model-result{width:330px;min-width:330px}.filters{grid-template-columns:1fr 1fr}.filter-status{display:none}}
 @media(max-width:680px){.topbar{padding:0 12px}.brand small,.count{display:none}.filters{position:static;grid-template-columns:1fr;padding:12px}.main{padding:12px}.record-body{display:block}.results-pane{border-left:0;border-top:1px solid var(--border)}.model-result{width:min(360px,calc(100vw - 64px));min-width:min(360px,calc(100vw - 64px))}.record-head{flex-wrap:wrap}.image-grid{grid-template-columns:1fr}.metrics-head{display:block}.metrics-context{margin-top:4px}}
@@ -498,7 +661,9 @@ dialog{border:0;border-radius:7px;padding:0;box-shadow:0 20px 60px rgba(20,28,45
 <section class="filters">
   <div class="field"><label for="modelTrigger">模型</label><div class="model-picker"><button id="modelTrigger" class="model-trigger" type="button">全部模型</button><div id="modelMenu" class="model-menu"><div class="model-menu-actions"><button id="selectAllModels" type="button">全选</button><button id="clearModels" type="button">清空</button></div><div id="modelOptions"></div></div></div></div>
   <div class="field"><label for="episodeFilter">Episode</label><select id="episodeFilter"><option value="">全部 Episode</option></select></div>
+  <div class="field"><label for="evaluationTypeFilter">Evaluation</label><select id="evaluationTypeFilter"><option value="">全部 Evaluation</option></select></div>
   <div class="field"><label for="modeFilter">Mode</label><select id="modeFilter"><option value="">全部 Mode</option></select></div>
+  <div class="field"><label for="conditionFilter">Condition</label><select id="conditionFilter"><option value="">全部 Condition</option></select></div>
   <div id="filterStatus" class="filter-status"></div>
 </section>
 <main class="main">
@@ -527,18 +692,20 @@ const fetchJSON=async(url,options)=>{const response=await fetch(url,options);con
 function fillSelect(select,values,label){const current=select.value;select.innerHTML=`<option value="">全部 ${esc(label)}</option>`+values.map(value=>`<option value="${esc(value)}">${esc(value)}</option>`).join("");if(values.includes(current))select.value=current}
 function updateModelTrigger(){const selected=[...state.selectedModels];const total=state.catalog?.model_names.length||0;$("modelTrigger").textContent=selected.length===total&&total?`全部模型 (${total})`:selected.length===0?"未选择模型":selected.length===1?selected[0]:`已选 ${selected.length} 个模型`}
 function renderModelPicker(selectAll=false){const models=state.catalog.model_names||[];if(selectAll||!state.modelsInitialized){state.selectedModels=new Set(models);state.modelsInitialized=true}else{state.selectedModels=new Set([...state.selectedModels].filter(model=>models.includes(model)))}$("modelOptions").innerHTML=models.map(model=>`<label class="model-option"><input type="checkbox" value="${esc(model)}" ${state.selectedModels.has(model)?"checked":""}><span>${esc(model)}</span></label>`).join("");$("modelOptions").querySelectorAll("input").forEach(input=>input.addEventListener("change",()=>{input.checked?state.selectedModels.add(input.value):state.selectedModels.delete(input.value);updateModelTrigger();loadReplies().catch(showError)}));updateModelTrigger()}
-async function loadCatalog(selectAll=false){state.catalog=await fetchJSON(apiPath("/api/catalog"));renderModelPicker(selectAll);fillSelect($("episodeFilter"),state.catalog.episode_ids,"Episode");fillSelect($("modeFilter"),state.catalog.modes,"Mode");$("sourceCount").textContent=`${state.catalog.source_count} files · ${state.catalog.record_count} records`;await loadReplies()}
-async function loadReplies(){if(state.selectedModels.size===0){state.payload={record_count:0,records:[],summaries:[],metric_groups:[]};$("filterStatus").textContent="0 steps";renderRecords();renderMetrics();return}const params=new URLSearchParams();params.set("model_names",[...state.selectedModels].join(","));[["episode_id",$("episodeFilter").value],["mode",$("modeFilter").value]].forEach(([key,value])=>{if(value)params.set(key,value)});$("filterStatus").textContent="加载中";state.payload=await fetchJSON(apiPath(`/api/replies?${params}`));const stepCount=new Set((state.payload.records||[]).map(recordGroupKey)).size;$("filterStatus").textContent=`${stepCount} steps · ${state.payload.record_count} results`;renderRecords();renderMetrics()}
+async function loadCatalog(selectAll=false){state.catalog=await fetchJSON(apiPath("/api/catalog"));renderModelPicker(selectAll);fillSelect($("episodeFilter"),state.catalog.episode_ids,"Episode");fillSelect($("evaluationTypeFilter"),state.catalog.evaluation_types||[],"Evaluation");fillSelect($("modeFilter"),state.catalog.modes,"Mode");fillSelect($("conditionFilter"),state.catalog.condition_ids||[],"Condition");$("sourceCount").textContent=`${state.catalog.source_count} files · ${state.catalog.record_count} records`;await loadReplies()}
+async function loadReplies(){if(state.selectedModels.size===0){state.payload={record_count:0,records:[],summaries:[],metric_groups:[]};$("filterStatus").textContent="0 steps";renderRecords();renderMetrics();return}const params=new URLSearchParams();params.set("model_names",[...state.selectedModels].join(","));[["episode_id",$("episodeFilter").value],["evaluation_type",$("evaluationTypeFilter").value],["mode",$("modeFilter").value],["condition_id",$("conditionFilter").value]].forEach(([key,value])=>{if(value)params.set(key,value)});$("filterStatus").textContent="加载中";state.payload=await fetchJSON(apiPath(`/api/replies?${params}`));const stepCount=new Set((state.payload.records||[]).map(recordGroupKey)).size;$("filterStatus").textContent=`${stepCount} steps · ${state.payload.record_count} results`;renderRecords();renderMetrics()}
 function actionText(action){if(!action)return"—";const nodes=Array.isArray(action.node_ids)?action.node_ids.join(" → "):"";return `${action.name||action.base_name||"unknown"}${nodes?`(${nodes})`:""}`}
-function recoveryHTML(value){if(!value)return'<span class="recovery-pill">未输出</span>';const required=value.required===true;return `<span class="recovery-pill ${required?"yes":"no"}">${required?"需要恢复":"无需恢复"}</span>${value.failed_action?`<span class="tag">${esc(value.failed_action)}</span>`:""}`}
-function recordGroupKey(record){return [record.source_file||"",record.episode_id||"",record.step??"",record.mode||""].join("\u001f")}
+function recoveryHTML(value){if(!value)return'<span class="recovery-pill">未输出</span>';const required=value.required===true;const nodes=Array.isArray(value.failed_node_ids)&&value.failed_node_ids.length?`<span class="tag">${esc(value.failed_node_ids.join(" → "))}</span>`:"";return `<span class="recovery-pill ${required?"yes":"no"}">${required?"需要恢复":"无需恢复"}</span>${value.failed_action?`<span class="tag">${esc(value.failed_action)}</span>`:""}${nodes}`}
+function recordGroupKey(record){return [record.evaluation_type||"open_loop_real",record.source_file||"",record.episode_id||"",record.step??"",record.mode||"",record.condition_id||""].join("\u001f")}
 function groupRecords(records){const groups=new Map();records.forEach(record=>{const key=recordGroupKey(record);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(record)});const modelOrder=new Map([...state.selectedModels].map((model,index)=>[model,index]));return [...groups.values()].map(group=>group.sort((left,right)=>(modelOrder.get(left.model_name)??9999)-(modelOrder.get(right.model_name)??9999)||String(left.result_file||"").localeCompare(String(right.result_file||""))))}
-function renderModelResult(record){const exact=record.score?.full_exact===true;const recoveryExact=record.recovery_score?.full_exact===true;return `<article class="model-result ${record.model_error?"error":""}"><header class="model-result-head"><span class="model-name">${esc(record.model_name)}</span><span class="tag ${exact?"good":"bad"}">Action ${exact?"正确":"错误"}</span><span class="tag ${recoveryExact?"good":"bad"}">Recovery ${recoveryExact?"正确":"错误"}</span><div class="record-file" title="${esc(record.result_file)}">${esc(record.result_file)}</div></header><div class="model-result-body"><section class="reason"><div class="section-label">Reason</div><div class="reason-text">${esc(record.reason||"未输出 reason")}</div>${record.model_error?`<div class="error-text">${esc(record.model_error)}</div>`:""}${record.parse_error?`<div class="error-text">${esc(record.parse_error)}</div>`:""}</section><section class="decision"><div class="section-label">Action</div><dl class="compare"><dt>Expected</dt><dd>${esc(actionText(record.expected_action))}</dd><dt>Predicted</dt><dd class="${exact?"action-match":"action-miss"}">${esc(actionText(record.predicted_action))}</dd></dl><div class="section-label">Failure recovery</div><dl class="compare"><dt>Expected</dt><dd class="recovery-row">${recoveryHTML(record.expected_recovery)}</dd><dt>Predicted</dt><dd class="recovery-row">${recoveryHTML(record.predicted_recovery)}</dd></dl></section></div></article>`}
-function renderRecords(){const root=$("records");const records=state.payload.records||[];if(!records.length){root.innerHTML='<div class="empty">没有符合当前筛选条件的记录</div>';return}const groups=groupRecords(records);root.innerHTML=groups.map(group=>{const shared=group.find(record=>(record.image_urls||[]).length)||group[0];const images=(shared.image_urls||[]).map((url,index)=>`<figure class="frame" data-image="${esc(url)}"><img src="${esc(url)}" alt="Observation ${index+1}" loading="lazy" onerror="this.parentElement.classList.add('broken');this.remove();this.parentElement.textContent='图片不可用'"></figure>`).join("");const frame=shared.frame_observation||shared.request_summary?.frame_observation||{};const hasError=group.some(record=>record.model_error);const modelCount=new Set(group.map(record=>record.model_name)).size;return `<article class="record ${hasError?"has-error":""}"><header class="record-head"><span class="step">STEP ${esc(shared.step)}</span><span class="tag">${esc(shared.episode_id)}</span><span class="tag">${esc(shared.mode)}</span><span class="tag">${modelCount} models · ${group.length} results</span></header><div class="record-body"><section class="visuals"><div class="section-label">Shared observation</div><div class="image-grid">${images||'<div class="frame broken">无图片</div>'}</div><div class="frame-meta">source step ${esc(frame.source_step??"—")} · episode ${esc((frame.source_episode_indices||[]).join(",")||"—")} · ${esc(frame.applied_sampling||"—")}</div></section><section class="results-pane"><div class="model-results-scroll" aria-label="模型结果横向对比"><div class="model-results">${group.map(renderModelResult).join("")}</div></div></section></div></article>`}).join("");root.querySelectorAll("[data-image]").forEach(node=>node.addEventListener("click",()=>{$("largeImage").src=node.dataset.image;$("imageDialog").showModal()}))}
-const metricOrder=["record_count","model_error_count","parse_success_rate","action_name_accuracy","object_accuracy","target_accuracy","node_ids_exact_accuracy","full_action_exact_accuracy","recovery_required_accuracy","recovery_failed_action_accuracy","recovery_exact_accuracy","recovery_and_action_exact_accuracy"];
-const metricLabels={record_count:"记录数",model_error_count:"模型错误数",parse_success_rate:"解析成功率",action_name_accuracy:"Action 名称准确率",object_accuracy:"Object 准确率",target_accuracy:"Target 准确率",node_ids_exact_accuracy:"Node IDs 准确率",full_action_exact_accuracy:"Action 完全准确率",recovery_required_accuracy:"Recovery 判断准确率",recovery_failed_action_accuracy:"失败动作准确率",recovery_exact_accuracy:"Recovery 完全准确率",recovery_and_action_exact_accuracy:"Recovery + Action 准确率"};
-function renderMetrics(){const root=$("metrics");const columns=state.payload.metric_groups||[];if(!columns.length){root.innerHTML='<div class="metrics-head"><h2>Episode metrics</h2></div><div class="empty">当前筛选范围没有可计算的指标</div>';return}const episodes=[...new Set(columns.map(column=>column.episode_id))];const selectedEpisode=$("episodeFilter").value;const modelOrder=new Map([...state.selectedModels].map((model,index)=>[model,index]));const colors=["#3f5fbd","#16794a","#c27412","#b4232f","#087f8c","#7651a8"];const modelColor=model=>colors[(modelOrder.get(model)??0)%colors.length];const charts=metricOrder.map(key=>{const isCount=key.endsWith("count");const maximum=isCount?Math.max(1,...columns.map(column=>Number(column.metrics[key]||0))):1;const episodeGroups=episodes.map(episode=>{const episodeColumns=columns.filter(column=>column.episode_id===episode);const rows=episodeColumns.map(column=>{const raw=column.metrics[key];const value=raw==null?0:Number(raw);const width=Math.max(0,Math.min(100,value/maximum*100));const display=isCount?(raw??"—"):pct(raw);const name=`${column.model_name} · ${column.mode}`;return `<div class="metric-bar-row" title="${esc(episode)} · ${esc(name)}: ${esc(display)}"><div class="metric-series">${esc(name)}</div><div class="bar-track"><div class="bar-fill" style="--bar-width:${width}%;--bar-color:${modelColor(column.model_name)}"></div></div><div class="metric-value">${esc(display)}</div></div>`}).join("");return `<section class="metric-episode">${selectedEpisode?"":`<div class="metric-episode-name">${esc(episode)}</div>`}${rows}</section>`}).join("");return `<article class="metric-chart"><h3>${esc(metricLabels[key]||key)}</h3><div class="metric-bars">${episodeGroups}</div></article>`}).join("");const configs=columns.map(column=>{const config=column.config||{};return `${column.episode_id} · ${column.model_name} · ${column.mode}: history=${config.history_source||"—"}, frames=${config.frames_per_camera??"—"}, sampling=${config.frame_sampling||"—"}, valid_actions=${config.includes_valid_actions!==false}`}).join(" · ");const scope=selectedEpisode?selectedEpisode:`${episodes.length} episodes`;root.innerHTML=`<div class="metrics-head"><h2>Episode metrics</h2><div class="metrics-context">${esc(scope)} · ${columns.length} result groups</div></div><div class="metric-grid">${charts}</div><div class="metric-config">${esc(configs)}</div>`}
-[$("episodeFilter"),$("modeFilter")].forEach(select=>select.addEventListener("change",()=>loadReplies().catch(showError)));$("modelTrigger").addEventListener("click",event=>{event.stopPropagation();$("modelMenu").classList.toggle("open")});$("modelMenu").addEventListener("click",event=>event.stopPropagation());document.addEventListener("click",()=>$("modelMenu").classList.remove("open"));$("selectAllModels").addEventListener("click",()=>{state.selectedModels=new Set(state.catalog.model_names);renderModelPicker();loadReplies().catch(showError)});$("clearModels").addEventListener("click",()=>{state.selectedModels.clear();renderModelPicker();loadReplies().catch(showError)});
+function renderModelResult(record){if(record.evaluation_type==="closed_loop_visible_graph"){const eventGood=record.event?.status==="success";const goal=record.goal_satisfied_after_action===true;const eventText=record.event?`${record.event.status||"unknown"}${record.event.failure_type?` · ${record.event.failure_type}`:""}`:"—";const disturbances=record.disturbances_applied||[];const disturbanceTag=disturbances.length?`<span class="tag">干扰 ${disturbances.length}</span>`:"";const disturbanceBlock=disturbances.length?`<div class="section-label">External graph disturbance</div><pre class="reason-text">${esc(JSON.stringify(disturbances,null,2))}</pre>`:"";return `<article class="model-result ${record.model_error?"error":""}"><header class="model-result-head"><span class="model-name">${esc(record.model_name)}</span><span class="tag ${eventGood?"good":"bad"}">Event ${eventGood?"成功":"失败"}</span><span class="tag ${goal?"good":""}">Goal ${goal?"满足":"未满足"}</span>${record.injection_applied?'<span class="tag bad">Injected failure</span>':""}${disturbanceTag}<div class="record-file" title="${esc(record.result_file)}">${esc(record.result_file)}</div></header><div class="model-result-body"><section class="reason"><div class="section-label">Reason</div><div class="reason-text">${esc(record.reason||"未输出 reason")}</div>${record.model_error?`<div class="error-text">${esc(record.model_error)}</div>`:""}${record.parse_error?`<div class="error-text">${esc(record.parse_error)}</div>`:""}${disturbanceBlock}</section><section class="decision"><div class="section-label">Closed-loop transition</div><dl class="compare"><dt>Action</dt><dd>${esc(actionText(record.predicted_action))}</dd><dt>Event</dt><dd class="${eventGood?"action-match":"action-miss"}">${esc(eventText)}</dd><dt>Goal cost</dt><dd>${esc(record.relaxed_completion_cost_before??"—")} → ${esc(record.relaxed_completion_cost_after??"—")}</dd></dl><div class="section-label">Failure recovery</div><dl class="compare"><dt>Expected</dt><dd class="recovery-row">${recoveryHTML(record.expected_recovery)}</dd><dt>Predicted</dt><dd class="recovery-row">${recoveryHTML(record.predicted_recovery)}</dd></dl></section></div></article>`}const exact=record.score?.full_exact===true;const groundingExact=record.recovery_score?.grounding_exact;const recoveryExact=groundingExact===true||(groundingExact==null&&record.recovery_score?.full_exact===true);return `<article class="model-result ${record.model_error?"error":""}"><header class="model-result-head"><span class="model-name">${esc(record.model_name)}</span><span class="tag ${exact?"good":"bad"}">Action ${exact?"正确":"错误"}</span><span class="tag ${recoveryExact?"good":"bad"}">Recovery ${recoveryExact?"正确":"错误"}</span><div class="record-file" title="${esc(record.result_file)}">${esc(record.result_file)}</div></header><div class="model-result-body"><section class="reason"><div class="section-label">Reason</div><div class="reason-text">${esc(record.reason||"未输出 reason")}</div>${record.model_error?`<div class="error-text">${esc(record.model_error)}</div>`:""}${record.parse_error?`<div class="error-text">${esc(record.parse_error)}</div>`:""}</section><section class="decision"><div class="section-label">Action</div><dl class="compare"><dt>Expected</dt><dd>${esc(actionText(record.expected_action))}</dd><dt>Predicted</dt><dd class="${exact?"action-match":"action-miss"}">${esc(actionText(record.predicted_action))}</dd></dl><div class="section-label">Failure recovery</div><dl class="compare"><dt>Expected</dt><dd class="recovery-row">${recoveryHTML(record.expected_recovery)}</dd><dt>Predicted</dt><dd class="recovery-row">${recoveryHTML(record.predicted_recovery)}</dd></dl></section></div></article>`}
+function renderRecords(){const root=$("records");const records=state.payload.records||[];if(!records.length){root.innerHTML='<div class="empty">没有符合当前筛选条件的记录</div>';return}const groups=groupRecords(records);root.innerHTML=groups.map(group=>{const shared=group.find(record=>(record.image_urls||[]).length)||group[0];const images=(shared.image_urls||[]).map((url,index)=>`<figure class="frame" data-image="${esc(url)}"><img src="${esc(url)}" alt="Observation ${index+1}" loading="lazy" onerror="this.parentElement.classList.add('broken');this.remove();this.parentElement.textContent='图片不可用'"></figure>`).join("");const closed=shared.evaluation_type==="closed_loop_visible_graph";const graph=closed?`<pre class="reason-text">${esc(JSON.stringify(shared.current_observation||{},null,2))}</pre>`:"";const frame=shared.frame_observation||shared.request_summary?.frame_observation||{};const hasError=group.some(record=>record.model_error);const modelCount=new Set(group.map(record=>record.model_name)).size;const conditionTag=shared.condition_id?`<span class="tag">${esc(shared.condition_id)}</span>`:"";const observation=closed?graph:`<div class="image-grid">${images||'<div class="frame broken">无图片</div>'}</div><div class="frame-meta">source step ${esc(frame.source_step??"—")} · episode ${esc((frame.source_episode_indices||[]).join(",")||"—")} · ${esc(frame.applied_sampling||"—")}</div>`;return `<article class="record ${hasError?"has-error":""}"><header class="record-head"><span class="step">STEP ${esc(shared.step)}</span><span class="tag">${esc(shared.episode_id)}</span><span class="tag">${esc(shared.evaluation_type||"open_loop_real")}</span><span class="tag">${esc(shared.mode)}</span>${conditionTag}<span class="tag">${modelCount} models · ${group.length} results</span></header><div class="record-body"><section class="visuals"><div class="section-label">Shared observation</div>${observation}</section><section class="results-pane"><div class="model-results-scroll" aria-label="模型结果横向对比"><div class="model-results">${group.map(renderModelResult).join("")}</div></div></section></div></article>`}).join("");root.querySelectorAll("[data-image]").forEach(node=>node.addEventListener("click",()=>{$("largeImage").src=node.dataset.image;$("imageDialog").showModal()}))}
+const openLoopMetrics=["action_admissibility_rate","soft_optimal_action_score","recovery_detection_f1","recovery_grounding_accuracy","exploration_opportunity_recall","normalized_goal_information_gain","premature_stop_rate","completion_stop_recall"];
+const closedLoopMetrics=["task_success_rate","goal_ever_satisfied_rate","final_goal_satisfied_rate","normalized_goal_progress","teacher_normalized_efficiency","action_executability_rate","average_step_count","episodes_with_injected_failure_rate","average_injected_failure_count","episodes_with_disturbance_rate","average_disturbance_count",...openLoopMetrics];
+const metricLabels={task_success_rate:"闭环结果 · 正确 Stop 成功率",goal_ever_satisfied_rate:"闭环结果 · 曾达成目标率",final_goal_satisfied_rate:"闭环结果 · 最终目标满足率",normalized_goal_progress:"闭环结果 · 归一化目标进展",teacher_normalized_efficiency:"闭环结果 · Teacher 归一化效率",action_executability_rate:"闭环诊断 · 动作可执行率",average_step_count:"闭环诊断 · 平均步数",episodes_with_injected_failure_rate:"干预诊断 · Failure episode 覆盖率",average_injected_failure_count:"干预诊断 · 平均注入 Failure 数",episodes_with_disturbance_rate:"干预诊断 · Graph 干扰 episode 覆盖率",average_disturbance_count:"干预诊断 · 平均 Graph 干扰数",action_admissibility_rate:"动作合理性 · 可接受动作率",soft_optimal_action_score:"动作合理性 · Soft 最优动作分",recovery_detection_f1:"失败恢复 · Recovery 检测 F1",recovery_grounding_accuracy:"失败恢复 · 对象 Grounding 准确率",exploration_opportunity_recall:"主动探索 · 机会召回率",normalized_goal_information_gain:"主动探索 · 归一化目标信息增益",premature_stop_rate:"完成判断 · 提前停止率（越低越好）",completion_stop_recall:"完成判断 · 完成停止召回率"};
+function renderMetricFacet(type,columns,selectedEpisode,modelColor){const episodes=[...new Set(columns.map(column=>column.episode_id))];const keys=type==="closed_loop_visible_graph"?closedLoopMetrics:openLoopMetrics;const charts=keys.map(key=>{const isCount=key.endsWith("count");const maximum=isCount?Math.max(1,...columns.map(column=>Number(column.metrics[key]||0))):1;const episodeGroups=episodes.map(episode=>{const episodeColumns=columns.filter(column=>column.episode_id===episode);const rows=episodeColumns.map(column=>{const raw=column.metrics[key];const value=raw==null?0:Number(raw);const width=Math.max(0,Math.min(100,value/maximum*100));const display=isCount?(raw??"—"):pct(raw);const failure=column.config?.failure_injection;const condition=column.condition_id;const name=`${column.model_name} · ${column.mode}${condition?` · ${condition}`:""}${failure&&failure!=="none"?` · ${failure}`:""}`;return `<div class="metric-bar-row" title="${esc(episode)} · ${esc(name)}: ${esc(display)}"><div class="metric-series">${esc(name)}</div><div class="bar-track"><div class="bar-fill" style="--bar-width:${width}%;--bar-color:${modelColor(column.model_name)}"></div></div><div class="metric-value">${esc(display)}</div></div>`}).join("");return `<section class="metric-episode">${selectedEpisode?"":`<div class="metric-episode-name">${esc(episode)}</div>`}${rows}</section>`}).join("");return `<article class="metric-chart"><h3>${esc(metricLabels[key]||key)}</h3><div class="metric-bars">${episodeGroups}</div></article>`}).join("");const title=type==="closed_loop_visible_graph"?"Closed-loop · Visible Graph":"Open-loop · Real Observation";return `<section class="metric-facet"><h3 class="metric-facet-title">${esc(title)}</h3><div class="metric-grid">${charts}</div></section>`}
+function renderMetrics(){const root=$("metrics");const columns=state.payload.metric_groups||[];if(!columns.length){root.innerHTML='<div class="metrics-head"><h2>Episode metrics</h2></div><div class="empty">当前筛选范围没有可计算的指标</div>';return}const selectedEpisode=$("episodeFilter").value;const modelOrder=new Map([...state.selectedModels].map((model,index)=>[model,index]));const colors=["#3f5fbd","#16794a","#c27412","#b4232f","#087f8c","#7651a8"];const modelColor=model=>colors[(modelOrder.get(model)??0)%colors.length];const types=[...new Set(columns.map(column=>column.evaluation_type||"open_loop_real"))];const facets=types.map(type=>renderMetricFacet(type,columns.filter(column=>(column.evaluation_type||"open_loop_real")===type),selectedEpisode,modelColor)).join("");const configs=columns.map(column=>{const config=column.config||{};return `${column.episode_id} · ${column.model_name} · ${column.mode}: type=${column.evaluation_type||"open_loop_real"}, history=${config.history_source||"—"}, valid_actions=${config.includes_valid_actions!==false}, failure=${config.failure_injection||"none"}, disturbance=${config.graph_disturbance_file||"none"}`}).join(" · ");const episodeCount=new Set(columns.map(column=>column.episode_id)).size;const scope=selectedEpisode?selectedEpisode:`${episodeCount} episodes`;root.innerHTML=`<div class="metrics-head"><h2>Episode metrics</h2><div class="metrics-context">${esc(scope)} · ${columns.length} result groups</div></div>${facets}<div class="metric-config">${esc(configs)}</div>`}
+[$("episodeFilter"),$("evaluationTypeFilter"),$("modeFilter"),$("conditionFilter")].forEach(select=>select.addEventListener("change",()=>loadReplies().catch(showError)));$("modelTrigger").addEventListener("click",event=>{event.stopPropagation();$("modelMenu").classList.toggle("open")});$("modelMenu").addEventListener("click",event=>event.stopPropagation());document.addEventListener("click",()=>$("modelMenu").classList.remove("open"));$("selectAllModels").addEventListener("click",()=>{state.selectedModels=new Set(state.catalog.model_names);renderModelPicker();loadReplies().catch(showError)});$("clearModels").addEventListener("click",()=>{state.selectedModels.clear();renderModelPicker();loadReplies().catch(showError)});
 function showError(error){const notice=$("notice");notice.textContent=error.message;notice.className="notice error"}
 $("openImport").addEventListener("click",()=>$("importDialog").showModal());document.querySelectorAll("[data-close]").forEach(button=>button.addEventListener("click",()=>$(button.dataset.close).close()));
 $("importFiles").addEventListener("click",async()=>{const jsonl=$("jsonlFile").files[0],summary=$("summaryFile").files[0],error=$("importError");error.style.display="none";if(!jsonl||!summary){error.textContent="请选择 JSONL 和 summary 文件";error.style.display="block";return}const button=$("importFiles");button.disabled=true;try{await fetchJSON(apiPath("/api/import"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jsonl_name:jsonl.name,jsonl_content:await jsonl.text(),summary_name:summary.name,summary_content:await summary.text()})});$("importDialog").close();$("jsonlFile").value="";$("summaryFile").value="";await loadCatalog(true)}catch(err){error.textContent=err.message;error.style.display="block"}finally{button.disabled=false}});

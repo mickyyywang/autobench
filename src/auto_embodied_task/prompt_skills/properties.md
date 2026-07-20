@@ -4,6 +4,7 @@
 
 - `GRABBABLE`: 可以被机器人抓取。
 - `MOVABLE`: 可以被移动；可操作任务物体通常同时需要 `GRABBABLE` 和 `MOVABLE`。
+- `CARRY_CONTENTS`: 允许容器或承载面在装有物体时被整体抓取；没有该属性的承载物必须先清空。`STABLE_TRANSPORT` 是同义兼容属性。
 - `SURFACES`: 可以作为 `ON` 的目标；没有该属性的节点不能作为 `ON` 目标。
 - `CONTAINERS`: 可以作为后续放入任务或 profile editor 的容器目标；初始 view graph 不输出 `INSIDE` 边。
 - `CAN_OPEN`: 可以打开/关闭；如果使用它，通常需要在 `states` 中写 `OPEN` 或 `CLOSED`。

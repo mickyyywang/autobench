@@ -75,9 +75,11 @@ def _evaluate(expression: Any, predicate_fn: PredicateFn, checks: list[dict[str,
         return False
     if isinstance(expression, dict):
         if "and" in expression:
-            return all(_evaluate(item, predicate_fn, checks) for item in _as_list(expression["and"]))
+            results = [_evaluate(item, predicate_fn, checks) for item in _as_list(expression["and"])]
+            return all(results)
         if "or" in expression:
-            return any(_evaluate(item, predicate_fn, checks) for item in _as_list(expression["or"]))
+            results = [_evaluate(item, predicate_fn, checks) for item in _as_list(expression["or"])]
+            return any(results)
         if "not" in expression:
             return not _evaluate(expression["not"], predicate_fn, checks)
         if "predicate" in expression:
@@ -94,8 +96,10 @@ def _evaluate(expression: Any, predicate_fn: PredicateFn, checks: list[dict[str,
         if isinstance(head, str) and normalize_relation(head) in {"AND", "OR"}:
             children = expression[1:]
             if normalize_relation(head) == "AND":
-                return all(_evaluate(item, predicate_fn, checks) for item in children)
-            return any(_evaluate(item, predicate_fn, checks) for item in children)
+                results = [_evaluate(item, predicate_fn, checks) for item in children]
+                return all(results)
+            results = [_evaluate(item, predicate_fn, checks) for item in children]
+            return any(results)
         if isinstance(head, str) and normalize_relation(head) == "NOT":
             if len(expression) != 2:
                 raise ValueError(f"not expression needs exactly one child: {expression}")

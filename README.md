@@ -365,6 +365,49 @@ PYTHONPATH=auto_embodied_task/src python -m auto_embodied_task serve-trajectory 
 
 Harness internals, supported action names, observation shape, failure injection behavior, and evaluator details should be checked directly in code, primarily `src/auto_embodied_task/harness.py`, `src/auto_embodied_task/harness_bp.py`, and `src/auto_embodied_task/goal.py`.
 
+### RoboTwin 2.0 backend
+
+The simulator-neutral harness accepts `--backend symbolic|robotwin`. Static compilation does not import SAPIEN and is the first check for every new scene:
+
+```bash
+PYTHONPATH=src python -m auto_embodied_task validate-robotwin-task \
+  --view-graph view_graph/整理办公桌面B_1.jsonl \
+  --tasks outputs/整理办公桌面B_1_tasks.jsonl \
+  --trajectory saved/整理办公桌面B_1_teacher_trajectories_20260712_231519__galaxea_r1lite_20260713_165639_192.168.31.142__aligned_20260715_214950.jsonl \
+  --asset-map exp/robotwin/config/b1_asset_map.json \
+  --output exp/robotwin/validation/current_static.json
+```
+
+The physical runtime uses the isolated environment `/home/wmq/.conda/envs/robotwin` and local RoboTwin checkout `/home/wmq/project/bench/RoboTwin`. Replay the existing failure/recovery episode with:
+
+```bash
+env -u DISPLAY CUDA_HOME=/home/wmq/.conda/envs/robotwin PYTHONPATH=src \
+  /home/wmq/.conda/envs/robotwin/bin/python -m auto_embodied_task \
+  replay-robotwin-trajectory \
+  --view-graph view_graph/整理办公桌面B_1.jsonl \
+  --tasks outputs/整理办公桌面B_1_tasks.jsonl \
+  --trajectory saved/整理办公桌面B_1_teacher_trajectories_20260712_231519__galaxea_r1lite_20260713_165639_192.168.31.142__aligned_20260715_214950.jsonl \
+  --asset-map exp/robotwin/config/b1_asset_map.json \
+  --robotwin-root /home/wmq/project/bench/RoboTwin \
+  --execution-mode assisted \
+  --output-dir exp/robotwin/experiments/b1_assisted_replay_49_attempt4 --seed 7
+```
+
+RoboTwin action execution is selected at runtime. Use `--execution-mode assisted`
+when reproducing an existing aligned trajectory and allowing the adapter's
+pose/drive/kinematic fallbacks. Use `--execution-mode strict` for physical
+acceptance and closed-loop evaluation; failed contact or predicates return an
+error instead of being committed. An assisted report may have `success=true`,
+but always records `strict_physical_acceptance=false`. Closed-loop collection
+uses the equivalent `--robotwin-execution-mode strict|assisted` option and
+defaults to `strict`.
+
+`failed_grab`, `failed_putin`, `failed_open`, `failed_close`, and `failed_attach` only count as failures when their physical evidence passes the corresponding verifier. Goal predicates are read from SAPIEN poses, AABBs, articulation positions, contacts, and fixed drives. Egocentric visibility uses `head_camera` actor segmentation; view-graph `OCCLUDES` counterfactuals use the stable `overview_camera` actor segmentation.
+
+Physical replay only accepts a trajectory with `real_alignment` metadata from `saved/`; passing the teacher trajectory from `outputs/` is rejected. The replay records one observation before the first aligned action (`step_0000`) and one after every aligned action. Each `trajectory[i].observation` in `replay_report.json` contains the structured scene state, visible nodes, visibility ratios, robot joint/end-effector state, and paths to the camera artifacts. `observations.jsonl` contains the same observation sequence; `observations/step_NNNN/` contains `observation.json` plus RGB PNG, depth NPY/PNG, and raw/visualized actor-segmentation NPY/PNG files for `head_camera`, `overview_camera`, `front_camera`, `left_camera`, and `right_camera`. `head_camera` is a 640x360, 72-degree vertical-FOV onboard view; the former high rear head view is retained as `overview_camera`. `acceptance.all_aligned_steps_executed` and `acceptance.all_observations_captured` are required for replay success.
+
+The archived seed-7 artifact at `exp/robotwin/archive/legacy_functional_proxy_replay/replay_report.json` is the earlier functional-proxy baseline: 49/49 real-aligned actions and 50/50 observations. It is not an acceptance result for the current official-object and corrected-articulation scene. The current successful assisted replay is `exp/robotwin/experiments/b1_assisted_replay_49_attempt4/`; its reproducibly sampled dense action captures are indexed by `dense_sampling_manifest.json`. Current configuration, audits, visual reviews, and new experiments live under `exp/robotwin/`; environment details are recorded in `exp/robotwin/docs/environment.md`.
+
 ## Real Trajectory Evaluation with MR Models
 
 `evaluate-real-trajectories` supports the internal MR multimodal gateways described by the examples in `/home/wmq/project/mr_model`. Set `MR_API_KEY`, select an `mr_*` provider, and pass the exact model name:
@@ -411,3 +454,100 @@ class MySetting(TaskModifier):
 ```
 
 Then import the module in `constraints/__init__.py` so the CLI can find it.
+
+
+  cd /home/wmq/project/bench/auto_embodied_task
+  scripts/evaluate_real_models_visible_graph_only.sh
+
+
+MODES='obs_only,visible_graph_only' HISTORY_SOURCE='teacher' ./scripts/evaluate_real_models_valid_compare.sh both
+
+
+› 不可执行在真实场景中是执行之后才知道不可执行，所以仍然是候选。我觉得没有问题。
+
+
+• 这样定义是合理的。valid_actions 表示“基于动作前 observation 可以合理尝试的动作”，而不是“执行器保证成功的动
+  作”。
+
+  三个指标因此形成清晰分工：
+
+  - action_admissibility：动作在执行前是否合理可尝试。
+  - soft_optimal_action_score：反事实执行后是否成功、是否推动任务接近目标。
+  - recovery：动作失败后是否识别失败并正确恢复。
+
+  因此某个动作可以同时满足：
+
+  action_admissibility = 1
+  soft_optimal_action_score = 0
+
+  例如尝试把物品放入看起来可用、但实际已满的容器。这不是指标矛盾，而是在分别衡量“选择是否合理”和“结果是否有
+  效”。
+
+
+cd /home/wmq/project/bench/auto_embodied_task
+./scripts/evaluate_view_graph_models_closed_loop.sh both
+
+
+
+
+
+如何生成manifests？
+  生成脚本：auto_embodied_task/scripts/generate_saved_intervention_manifests.py:492
+  它会针对每个 episode 独立分析：
+  - task_completion_criterion
+  - initial_view_graph
+  - teacher 成功动作序列
+  - alignment-only 状态变化
+  - 合法目标与错误目标
+  - 可见物体、容器状态和遮挡关系
+
+  然后独立选择：
+
+  - state_regression
+  - completed_subgoal_rollback
+  - wrong_container_relocation
+  - add_occlusion
+  - 每种动作类型一次的 failure injection
+
+  不再包含针对 cosmetics/office/tabletop 的固定物体模板。错误容器也会排除该物体的所有合法目标，并优先选择轨迹中实际使用过、干扰发生时可见的容器。
+
+  生成后默认进行符号回放，验证：
+
+  - trigger 能被 teacher 轨迹触发
+  - 干扰确实改变图状态
+  - 被移动物体仍然可见
+  - 恢复动作可以成功
+  - 新增遮挡能够被解除
+
+  manifest v3 的 add_occlusion 不再固定发生在 step 1。运行时从第 3 个模型 step
+  起，在任务进度 10%～80% 的窗口内持续检查候选；只有遮挡源和未完成目标当前
+  都可见、空间关系合理，并且实际预演确认 open/move_aside 可以恢复时，才注入
+  一次。实际选中的 source/target 会记录到 step 的 runtime_selection 和 spec。
+
+  先预览而不写文件：
+
+  cd /home/wmq/project/bench/auto_embodied_task
+
+  python scripts/generate_saved_intervention_manifests.py \
+    --saved-dir saved \
+    --output-dir exp/intervention_manifests \
+    --dry-run
+
+  生成新 episode，保留已有 manifest：
+
+  python scripts/generate_saved_intervention_manifests.py \
+    --saved-dir saved \
+    --output-dir exp/intervention_manifests
+
+  重新生成并覆盖全部：
+
+  python scripts/generate_saved_intervention_manifests.py \
+    --saved-dir saved \
+    --output-dir exp/intervention_manifests \
+    --overwrite
+
+
+
+view graph闭环评测：
+  cd /home/wmq/project/bench/auto_embodied_task
+  ./scripts/evaluate_all_view_graph_manifest_closed_loop.sh

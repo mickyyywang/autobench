@@ -685,7 +685,7 @@ def _render_alignment_html() -> str:
         <div class="row">
           <button id="undo" disabled title="撤销上一步操作（Ctrl/Cmd+Z）">↶ 撤销</button>
           <button id="autoAlign">按顺序重置</button>
-          <button id="addRow">增加空行</button>
+          <button id="addRow" title="在当前选中行下方增加空行">增加空行</button>
         </div>
       </div>
       <div class="scroll">
@@ -1680,8 +1680,11 @@ el("undo").addEventListener("click", undoLastOperation);
 el("autoAlign").addEventListener("click", () => resetAlignment(true));
 el("addRow").addEventListener("click", () => {
   pushHistory("增加空行");
-  state.rows.push(newManualRow());
-  state.selectedRowIndex = state.rows.length - 1;
+  const insertIndex = state.rows.length
+    ? Math.min(Math.max(state.selectedRowIndex + 1, 0), state.rows.length)
+    : 0;
+  state.rows.splice(insertIndex, 0, newManualRow());
+  state.selectedRowIndex = insertIndex;
   renderWorkspace();
 });
 el("trajectorySelect").addEventListener("change", () => {

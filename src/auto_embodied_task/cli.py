@@ -224,6 +224,27 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--tasks", required=True, help="Generated task JSONL path.")
     collect.add_argument("--output", required=True, help="Output trajectory JSONL path.")
     collect.add_argument(
+        "--backend",
+        choices=("symbolic", "robotwin"),
+        default="symbolic",
+        help="Execution backend. robotwin executes and measures actions in RoboTwin/SAPIEN.",
+    )
+    collect.add_argument("--robotwin-root", default="/home/wmq/project/bench/RoboTwin")
+    collect.add_argument("--robotwin-task-config", default="task_config/demo_clean.yml")
+    collect.add_argument("--robotwin-asset-map", default=None)
+    collect.add_argument("--robotwin-output-dir", default="outputs/robotwin")
+    collect.add_argument("--robotwin-seed", type=int, default=7)
+    collect.add_argument("--robotwin-render", action="store_true")
+    collect.add_argument(
+        "--robotwin-execution-mode",
+        choices=("strict", "assisted"),
+        default="strict",
+        help=(
+            "strict rejects actions without measured physical success; assisted allows "
+            "pose/drive/kinematic fallbacks for trajectory reproduction."
+        ),
+    )
+    collect.add_argument(
         "--mode",
         choices=("replay", "teacher"),
         default="replay",
@@ -322,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_real.add_argument("--retry-max-seconds", type=float, default=60.0)
     eval_real.add_argument(
         "--modes",
-        default="obs_only,graph_only,obs_plus_graph,wrong_graph_plus_obs",
+        default="obs_only,visible_graph_only,graph_only,obs_plus_graph,wrong_graph_plus_obs",
         help="Comma separated eval modes.",
     )
     eval_real.add_argument(
@@ -336,6 +357,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Include the graph-derived valid_actions candidate list in model requests.",
+    )
+    eval_real.add_argument(
+        "--soft-optimal-beta",
+        type=float,
+        default=1.0,
+        help="Inverse temperature for relaxed-cost soft optimal action scoring.",
     )
     eval_real.add_argument("--frame-count", type=int, default=2)
     eval_real.add_argument("--observation-window-seconds", type=float, default=0.5)
@@ -356,85 +383,149 @@ def build_parser() -> argparse.ArgumentParser:
     eval_real.add_argument("--oss-endpoint", default=None)
     eval_real.add_argument("--cache-dir", default=None)
 
-    export_og = subparsers.add_parser(
-        "export-omnigibson-config",
-        help="Export a view graph into an OmniGibson-compatible JSON config package.",
+    eval_graph_rollout = subparsers.add_parser(
+        "evaluate-view-graph-rollouts",
+        help="Run closed-loop model evaluation from saved initial view graphs.",
     )
-    export_og.add_argument("--view-graph", required=True, help="Input view graph JSONL path.")
-    export_og.add_argument("--asset-map", default=None, help="Optional Autobench-to-OmniGibson asset map JSON.")
-    export_og.add_argument("--output-dir", required=True, help="Directory for og_config.json and reports.")
-    export_og.add_argument(
-        "--no-primitive-fallback",
-        action="store_true",
-        help="Fail unmapped assets instead of writing PrimitiveObject fallback records.",
+    eval_graph_rollout.add_argument("--input", required=True, help="Input aligned JSONL from saved/.")
+    eval_graph_rollout.add_argument(
+        "--output",
+        required=True,
+        help="Output evaluation JSONL base path. A timestamp is appended automatically.",
     )
+    eval_graph_rollout.add_argument(
+        "--provider",
+        choices=("openai", "qwen", "compatible", "mr_openai", "mr_anthropic", "mr_google"),
+        default="qwen",
+    )
+    eval_graph_rollout.add_argument("--model", default=None)
+    eval_graph_rollout.add_argument("--model-name", default=None)
+    eval_graph_rollout.add_argument("--api-key-env", default=None)
+    eval_graph_rollout.add_argument("--api-base-url", default=None)
+    eval_graph_rollout.add_argument(
+        "--api-style",
+        choices=("auto", "chat_completions", "responses", "anthropic_messages", "gemini_generate_content"),
+        default="auto",
+    )
+    eval_graph_rollout.add_argument("--timeout-seconds", type=int, default=120)
+    eval_graph_rollout.add_argument("--temperature", type=float, default=0.0)
+    eval_graph_rollout.add_argument("--max-output-tokens", type=int, default=2048)
+    eval_graph_rollout.add_argument("--max-api-attempts", type=int, default=1)
+    eval_graph_rollout.add_argument("--retry-backoff-seconds", type=float, default=5.0)
+    eval_graph_rollout.add_argument("--retry-max-seconds", type=float, default=60.0)
+    eval_graph_rollout.add_argument(
+        "--valid-actions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include graph-derived valid_actions in each closed-loop model request.",
+    )
+    eval_graph_rollout.add_argument("--soft-optimal-beta", type=float, default=1.0)
+    eval_graph_rollout.add_argument("--max-steps", type=int, default=100)
+    eval_graph_rollout.add_argument("--history-window", type=int, default=8)
+    eval_graph_rollout.add_argument("--max-consecutive-model-errors", type=int, default=3)
+    eval_graph_rollout.add_argument(
+        "--failure-injection",
+        choices=("none", "once", "probability", "all"),
+        default="none",
+        help=(
+            "Inject failed_<action> events only for selected actions that would normally "
+            "execute successfully."
+        ),
+    )
+    eval_graph_rollout.add_argument(
+        "--failure-actions",
+        default="all",
+        help="Comma separated action names eligible for injection, or all.",
+    )
+    eval_graph_rollout.add_argument("--failure-probability", type=float, default=0.0)
+    eval_graph_rollout.add_argument("--max-failures-per-episode", type=int, default=1)
+    eval_graph_rollout.add_argument("--failure-seed", type=int, default=None)
+    eval_graph_rollout.add_argument(
+        "--graph-disturbance-file",
+        default=None,
+        help=(
+            "Optional JSON/JSONL schedule of external graph changes applied before the "
+            "specified step observation."
+        ),
+    )
+    eval_graph_rollout.add_argument("--fail-fast", action="store_true")
 
-    validate_og = subparsers.add_parser(
-        "validate-omnigibson-task",
-        help="Validate whether a view graph and task can be exported to the OmniGibson adapter layer.",
+    eval_graph_manifest = subparsers.add_parser(
+        "evaluate-view-graph-intervention-manifest",
+        help="Run manifest conditions as independent closed-loop view-graph rollouts.",
     )
-    validate_og.add_argument("--view-graph", required=True, help="Input view graph JSONL path.")
-    validate_og.add_argument("--tasks", required=True, help="Task JSONL path.")
-    validate_og.add_argument("--asset-map", default=None, help="Optional Autobench-to-OmniGibson asset map JSON.")
-    validate_og.add_argument("--trajectory", default=None, help="Optional trajectory JSONL to validate action parsing.")
-    validate_og.add_argument("--output", required=True, help="Validation report JSON output path.")
-    validate_og.add_argument(
-        "--no-primitive-fallback",
-        action="store_true",
-        help="Treat missing asset map entries as errors.",
+    eval_graph_manifest.add_argument("--manifest", required=True)
+    eval_graph_manifest.add_argument("--output-dir", required=True)
+    eval_graph_manifest.add_argument(
+        "--conditions",
+        default="all",
+        help="Comma separated condition ids, or all.",
     )
+    eval_graph_manifest.add_argument(
+        "--provider",
+        choices=("openai", "qwen", "compatible", "mr_openai", "mr_anthropic", "mr_google"),
+        default="qwen",
+    )
+    eval_graph_manifest.add_argument("--model", default=None)
+    eval_graph_manifest.add_argument("--model-name", default=None)
+    eval_graph_manifest.add_argument("--api-key-env", default=None)
+    eval_graph_manifest.add_argument("--api-base-url", default=None)
+    eval_graph_manifest.add_argument(
+        "--api-style",
+        choices=("auto", "chat_completions", "responses", "anthropic_messages", "gemini_generate_content"),
+        default="auto",
+    )
+    eval_graph_manifest.add_argument("--timeout-seconds", type=int, default=120)
+    eval_graph_manifest.add_argument("--temperature", type=float, default=0.0)
+    eval_graph_manifest.add_argument("--max-output-tokens", type=int, default=2048)
+    eval_graph_manifest.add_argument("--max-api-attempts", type=int, default=1)
+    eval_graph_manifest.add_argument("--retry-backoff-seconds", type=float, default=5.0)
+    eval_graph_manifest.add_argument("--retry-max-seconds", type=float, default=60.0)
+    eval_graph_manifest.add_argument(
+        "--valid-actions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    eval_graph_manifest.add_argument("--soft-optimal-beta", type=float, default=1.0)
+    eval_graph_manifest.add_argument("--max-steps", type=int, default=100)
+    eval_graph_manifest.add_argument("--history-window", type=int, default=8)
+    eval_graph_manifest.add_argument("--max-consecutive-model-errors", type=int, default=3)
+    eval_graph_manifest.add_argument("--fail-fast", action="store_true")
 
-    replay_og = subparsers.add_parser(
-        "replay-omnigibson-trajectory",
-        help="Replay an Autobench trajectory through the OmniGibson adapter state-level backend.",
+    validate_robotwin = subparsers.add_parser(
+        "validate-robotwin-task",
+        help="Compile a view graph/task/trajectory and report RoboTwin physical coverage.",
     )
-    replay_og.add_argument("--config", required=True, help="og_config.json exported by export-omnigibson-config.")
-    replay_og.add_argument("--trajectory", required=True, help="Teacher trajectory JSONL path.")
-    replay_og.add_argument("--mode", choices=("state",), default="state")
-    replay_og.add_argument("--output-dir", required=True, help="Replay report output directory.")
+    validate_robotwin.add_argument("--view-graph", required=True)
+    validate_robotwin.add_argument("--tasks", required=True)
+    validate_robotwin.add_argument("--trajectory", default=None)
+    validate_robotwin.add_argument("--asset-map", default=None)
+    validate_robotwin.add_argument("--robotwin-root", default=None)
+    validate_robotwin.add_argument("--seed", type=int, default=7)
+    validate_robotwin.add_argument("--output", required=True)
 
-    export_bddl = subparsers.add_parser(
-        "export-bddl",
-        help="Export BDDL-compatible goal predicates plus custom predicate reports.",
+    replay_robotwin = subparsers.add_parser(
+        "replay-robotwin-trajectory",
+        help="Replay real-aligned steps from saved/ in the RoboTwin 2.0 physical backend.",
     )
-    export_bddl.add_argument("--view-graph", required=True, help="Input view graph JSONL path.")
-    export_bddl.add_argument("--tasks", required=True, help="Task JSONL path.")
-    export_bddl.add_argument("--asset-map", default=None, help="Accepted for CLI symmetry; currently only used by validation.")
-    export_bddl.add_argument("--output-dir", required=True, help="BDDL package output directory.")
-
-    run_og = subparsers.add_parser(
-        "run-omnigibson-config",
-        help="Optionally load an exported config in an installed OmniGibson runtime.",
+    replay_robotwin.add_argument("--view-graph", required=True)
+    replay_robotwin.add_argument("--tasks", required=True)
+    replay_robotwin.add_argument("--trajectory", required=True)
+    replay_robotwin.add_argument("--asset-map", default=None)
+    replay_robotwin.add_argument("--robotwin-root", default="/home/wmq/project/bench/RoboTwin")
+    replay_robotwin.add_argument("--task-config", default="task_config/demo_clean.yml")
+    replay_robotwin.add_argument("--seed", type=int, default=7)
+    replay_robotwin.add_argument("--render", action="store_true")
+    replay_robotwin.add_argument(
+        "--execution-mode",
+        choices=("strict", "assisted"),
+        default="strict",
+        help=(
+            "strict produces physical acceptance evidence; assisted prioritizes "
+            "successful reproduction of an existing aligned trajectory."
+        ),
     )
-    run_og.add_argument("--config", required=True, help="og_config.json exported by export-omnigibson-config.")
-    run_og.add_argument("--output-dir", default=None, help="Runtime report directory. Defaults to config directory.")
-    run_og.add_argument(
-        "--no-apply-initial-state",
-        action="store_true",
-        help="Create the environment without attempting initial state application.",
-    )
-
-    dump_obs = subparsers.add_parser(
-        "dump-omnigibson-observation",
-        help="Load an exported OmniGibson config and dump real robot sensor observations.",
-    )
-    dump_obs.add_argument("--config", required=True, help="og_config.json exported by export-omnigibson-config.")
-    dump_obs.add_argument("--trajectory", default=None, help="Optional Autobench trajectory JSONL to replay best-effort.")
-    dump_obs.add_argument("--output-dir", required=True, help="Directory for observation files and reports.")
-    dump_obs.add_argument("--robot-model", default="fetch", help="OmniGibson robot model to insert if config has none.")
-    dump_obs.add_argument(
-        "--modalities",
-        default="rgb,depth",
-        help="Comma separated observation modalities, e.g. rgb,depth,seg_instance.",
-    )
-    dump_obs.add_argument("--image-width", type=int, default=128)
-    dump_obs.add_argument("--image-height", type=int, default=128)
-    dump_obs.add_argument("--steps", type=int, default=1, help="Random environment steps before dumping observations.")
-    dump_obs.add_argument(
-        "--force",
-        action="store_true",
-        help="Bypass runtime preflight blockers and attempt to start Isaac/OmniGibson anyway.",
-    )
+    replay_robotwin.add_argument("--output-dir", required=True)
     return parser
 
 
@@ -496,7 +587,6 @@ def main(argv: list[str] | None = None) -> int:
         serve_view_graph_app(
             host=args.host,
             port=args.port,
-            base_path=args.base_path,
             open_browser=args.open_browser,
         )
         return 0
@@ -576,6 +666,23 @@ def main(argv: list[str] | None = None) -> int:
             max_failures_per_episode=args.max_failures_per_episode,
             seed=args.failure_seed,
         )
+        backend_factory = None
+        if args.backend == "robotwin":
+            from .robotwin_adapter import RoboTwinBackend, RoboTwinBackendConfig
+
+            backend_config = RoboTwinBackendConfig(
+                robotwin_root=Path(args.robotwin_root),
+                task_config=Path(args.robotwin_task_config),
+                asset_map_path=Path(args.robotwin_asset_map) if args.robotwin_asset_map else None,
+                output_dir=Path(args.robotwin_output_dir),
+                seed=args.robotwin_seed,
+                render=args.robotwin_render,
+                execution_mode=args.robotwin_execution_mode,
+            )
+
+            def backend_factory(graph, task, placement_constraints):
+                return RoboTwinBackend(graph, task, backend_config, placement_constraints=placement_constraints)
+
         result = collect_symbolic_trajectories(
             view_graph_path=args.view_graph,
             tasks_path=args.tasks,
@@ -586,8 +693,9 @@ def main(argv: list[str] | None = None) -> int:
             teacher_config=teacher_config,
             failure_injection=failure_injection,
             placement_edge_constraints_path=args.placement_edge_constraints,
+            backend_factory=backend_factory,
         )
-        print(f"Wrote {result.count} symbolic trajectories to {result.output_path}")
+        print(f"Wrote {result.count} {args.backend} trajectories to {result.output_path}")
         return 0
     if args.command == "evaluate-real-trajectories":
         from .real_observation_eval import RealObservationEvalConfig, evaluate_real_trajectories
@@ -608,6 +716,7 @@ def main(argv: list[str] | None = None) -> int:
             modes=_csv(args.modes),
             history_source=args.history_source,
             include_valid_actions=args.valid_actions,
+            soft_optimal_beta=args.soft_optimal_beta,
             frame_count=args.frame_count,
             cameras=_csv(args.cameras),
             observation_window_seconds=args.observation_window_seconds,
@@ -627,91 +736,114 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote {result['count']} evaluation records to {result['output_path']}")
         print(f"Wrote evaluation summary to {result['summary_path']}")
         return 0
-    if args.command == "export-omnigibson-config":
-        from .omnigibson_adapter import export_omnigibson_config
+    if args.command == "evaluate-view-graph-rollouts":
+        from .view_graph_rollout_eval import ViewGraphRolloutEvalConfig, evaluate_view_graph_rollouts
 
-        paths = export_omnigibson_config(
-            view_graph_path=args.view_graph,
-            asset_map_path=args.asset_map,
-            output_dir=args.output_dir,
-            allow_primitive_fallback=not args.no_primitive_fallback,
+        config = ViewGraphRolloutEvalConfig(
+            provider=args.provider,
+            model=args.model,
+            model_name=args.model_name,
+            api_key_env=args.api_key_env,
+            api_base_url=args.api_base_url,
+            api_style=args.api_style,
+            timeout_seconds=args.timeout_seconds,
+            temperature=args.temperature,
+            max_output_tokens=args.max_output_tokens,
+            max_api_attempts=args.max_api_attempts,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            retry_max_seconds=args.retry_max_seconds,
+            include_valid_actions=args.valid_actions,
+            soft_optimal_beta=args.soft_optimal_beta,
+            max_steps=args.max_steps,
+            history_window=args.history_window,
+            max_consecutive_model_errors=args.max_consecutive_model_errors,
+            failure_injection=args.failure_injection,
+            failure_actions=_csv(args.failure_actions),
+            failure_probability=args.failure_probability,
+            max_failures_per_episode=args.max_failures_per_episode,
+            failure_seed=args.failure_seed,
+            graph_disturbance_file=args.graph_disturbance_file,
+            fail_fast=args.fail_fast,
         )
-        print(f"Wrote OmniGibson config package to {args.output_dir}")
-        for name, path in paths.items():
-            print(f"  {name}: {path}")
+        result = evaluate_view_graph_rollouts(
+            input_path=args.input,
+            output_path=args.output,
+            config=config,
+        )
+        print(f"Wrote {result['count']} closed-loop records to {result['output_path']}")
+        print(f"Wrote evaluation summary to {result['summary_path']}")
         return 0
-    if args.command == "validate-omnigibson-task":
-        from .omnigibson_adapter import validate_omnigibson_task
+    if args.command == "evaluate-view-graph-intervention-manifest":
+        from .view_graph_rollout_eval import (
+            ViewGraphRolloutEvalConfig,
+            evaluate_view_graph_intervention_manifest,
+        )
 
-        report = validate_omnigibson_task(
+        config = ViewGraphRolloutEvalConfig(
+            provider=args.provider,
+            model=args.model,
+            model_name=args.model_name,
+            api_key_env=args.api_key_env,
+            api_base_url=args.api_base_url,
+            api_style=args.api_style,
+            timeout_seconds=args.timeout_seconds,
+            temperature=args.temperature,
+            max_output_tokens=args.max_output_tokens,
+            max_api_attempts=args.max_api_attempts,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            retry_max_seconds=args.retry_max_seconds,
+            include_valid_actions=args.valid_actions,
+            soft_optimal_beta=args.soft_optimal_beta,
+            max_steps=args.max_steps,
+            history_window=args.history_window,
+            max_consecutive_model_errors=args.max_consecutive_model_errors,
+            fail_fast=args.fail_fast,
+        )
+        result = evaluate_view_graph_intervention_manifest(
+            manifest_path=args.manifest,
+            output_dir=args.output_dir,
+            config=config,
+            condition_ids=_csv(args.conditions),
+        )
+        print(f"Completed {result['condition_count']} intervention conditions")
+        print(f"Wrote intervention suite summary to {result['suite_summary_path']}")
+        return 0
+    if args.command == "validate-robotwin-task":
+        from .robotwin_adapter import validate_robotwin_task
+
+        report = validate_robotwin_task(
             view_graph_path=args.view_graph,
             tasks_path=args.tasks,
-            asset_map_path=args.asset_map,
             output_path=args.output,
+            asset_map_path=args.asset_map,
             trajectory_path=args.trajectory,
-            allow_primitive_fallback=not args.no_primitive_fallback,
+            robotwin_root=args.robotwin_root,
+            seed=args.seed,
         )
-        print(f"Wrote OmniGibson validation report to {args.output}")
-        print(f"ok={report['ok']} errors={len(report['errors'])} warnings={len(report['warnings'])}")
-        return 0
-    if args.command == "replay-omnigibson-trajectory":
-        from .omnigibson_adapter import replay_omnigibson_trajectory
+        print(f"Wrote RoboTwin validation report to {args.output}")
+        print(
+            f"ok={report['ok']} mapped={report['coverage']['nodes']['mapped']}/"
+            f"{report['coverage']['nodes']['total']} unsupported_actions="
+            f"{len(report['unsupported_actions'])}"
+        )
+        return 0 if report["ok"] else 1
+    if args.command == "replay-robotwin-trajectory":
+        from .robotwin_adapter import replay_robotwin_trajectory
 
-        paths = replay_omnigibson_trajectory(
-            config_path=args.config,
+        report = replay_robotwin_trajectory(
+            view_graph_path=args.view_graph,
+            tasks_path=args.tasks,
             trajectory_path=args.trajectory,
+            asset_map_path=args.asset_map,
+            robotwin_root=args.robotwin_root,
+            task_config=args.task_config,
+            seed=args.seed,
+            render=args.render,
+            execution_mode=args.execution_mode,
             output_dir=args.output_dir,
-            mode=args.mode,
         )
-        print(f"Wrote state-level replay reports to {args.output_dir}")
-        for name, path in paths.items():
-            print(f"  {name}: {path}")
-        return 0
-    if args.command == "export-bddl":
-        from .omnigibson_adapter.goal_mapper import export_bddl_package
-        from .omnigibson_adapter.io_utils import load_tasks_jsonl, require_single_graph
-
-        graph = require_single_graph(load_view_graphs_jsonl(args.view_graph), args.view_graph)
-        tasks = load_tasks_jsonl(args.tasks)
-        output_dir = Path(args.output_dir)
-        for task in tasks:
-            target_dir = output_dir if len(tasks) == 1 else output_dir / task.task_id
-            export_bddl_package(task=task, graph=graph, output_dir=target_dir)
-        print(f"Wrote BDDL package for {len(tasks)} task(s) to {args.output_dir}")
-        return 0
-    if args.command == "run-omnigibson-config":
-        from .omnigibson_adapter.runtime import run_omnigibson_config
-
-        report = run_omnigibson_config(
-            config_path=args.config,
-            output_dir=args.output_dir,
-            apply_initial_state=not args.no_apply_initial_state,
-        )
-        print(f"OmniGibson runtime ok={report.get('ok')} stage={report.get('stage')}")
-        if report.get("error"):
-            print(report["error"])
-        return 0 if report.get("ok") else 1
-    if args.command == "dump-omnigibson-observation":
-        from .omnigibson_adapter.runtime import dump_omnigibson_observation
-
-        report = dump_omnigibson_observation(
-            config_path=args.config,
-            output_dir=args.output_dir,
-            trajectory_path=args.trajectory,
-            robot_model=args.robot_model,
-            modalities=_csv(args.modalities),
-            image_width=args.image_width,
-            image_height=args.image_height,
-            steps=args.steps,
-            force=args.force,
-        )
-        print(f"OmniGibson observation ok={report.get('ok')} stage={report.get('stage')}")
-        if report.get("message"):
-            print(report["message"])
-        if report.get("error"):
-            print(report["error"])
-        if report.get("files"):
-            print(f"wrote {len(report['files'])} observation files to {args.output_dir}")
-        return 0 if report.get("ok") else 1
+        print(f"RoboTwin replay success={report['success']} steps={report['step_count']}")
+        print(f"Wrote physical replay artifacts to {args.output_dir}")
+        return 0 if report["success"] else 1
     parser.error(f"Unknown command: {args.command}")
     return 2

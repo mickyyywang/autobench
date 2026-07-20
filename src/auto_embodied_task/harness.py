@@ -9,7 +9,7 @@ import os
 import random
 import re
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 from openai import OpenAI
 
@@ -156,7 +156,6 @@ AVAILABLE_ACTIONS = (
     "grab",
     "pick",
     "attach",
-    "assemble",
     "puton",
     "putin",
     "move_aside",
@@ -179,6 +178,7 @@ class FailureInjectionConfig:
     probability: float = 0.0
     max_failures_per_episode: int = 1
     seed: int | None = None
+    deduplication_scope: str = "signature"
 
     def __post_init__(self) -> None:
         self.mode = str(self.mode).lower()
@@ -191,6 +191,11 @@ class FailureInjectionConfig:
             raise ValueError("failure injection probability must be between 0 and 1")
         if self.max_failures_per_episode < 0:
             raise ValueError("max_failures_per_episode must be non-negative")
+        self.deduplication_scope = str(self.deduplication_scope).strip().lower()
+        if self.deduplication_scope not in {"signature", "action_name"}:
+            raise ValueError(
+                "failure injection deduplication_scope must be signature or action_name"
+            )
 
     @property
     def enabled(self) -> bool:
@@ -204,6 +209,16 @@ class FailureInjectionConfig:
             return True
         return action_name in self.actions
 
+    def deduplication_key(
+        self,
+        action_name: str,
+        node_ids: list[str] | tuple[str, ...],
+    ) -> tuple[str, ...]:
+        normalized_name = str(action_name).lower().removeprefix("failed_")
+        if self.deduplication_scope == "action_name":
+            return (normalized_name,)
+        return (normalized_name, *(str(node_id) for node_id in node_ids))
+
     def to_json(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
@@ -211,6 +226,7 @@ class FailureInjectionConfig:
             "probability": self.probability,
             "max_failures_per_episode": self.max_failures_per_episode,
             "seed": self.seed,
+            "deduplication_scope": self.deduplication_scope,
         }
 
 
@@ -225,8 +241,7 @@ ACTION_DESCRIPTIONS = {
     "press": "Press a visible reachable object with PRESSABLE affordance.",
     "grab": "Try to hold a visible reachable grabbable movable object; loaded carriers may reject the attempt.",
     "pick": "Alias of grab; loaded carriers may reject the attempt.",
-    "attach": "Attach two visible or held compatible part nodes.",
-    "assemble": "Assemble a visible object when all parts are reachable.",
+    "attach": "Attach two visible or held compatible part nodes; use this action to satisfy ASSEMBLED goals.",
     "puton": "Place a held object on a visible surface.",
     "putin": "Place a held object inside a visible container that is open if openable.",
     "move_aside": "Move a visible movable blocker aside so hidden nodes may become visible.",
@@ -246,7 +261,6 @@ ACTION_HAND_USAGE = {
     "grab": {"required_free_hands": 1, "held_object_required": False, "result": "occupies_one_hand"},
     "pick": {"required_free_hands": 1, "held_object_required": False, "result": "occupies_one_hand"},
     "attach": {"required_free_hands": 2, "held_object_required": False, "result": "two_hand_coordination"},
-    "assemble": {"required_free_hands": 2, "held_object_required": False, "result": "two_hand_coordination"},
     "puton": {"required_free_hands": 0, "held_object_required": True, "result": "frees_one_hand"},
     "putin": {"required_free_hands": 0, "held_object_required": True, "result": "frees_one_hand"},
     "move_aside": {"required_free_hands": 1, "held_object_required": False, "result": "hands_unchanged"},
@@ -420,7 +434,10 @@ def _valid_teacher_actions(observation: dict[str, Any], history: list[dict[str, 
             node.get("openable")
             and not node.get("open")
             and not held_ids
-            and _teacher_node_on_surface(node, visible_by_id)
+            and (
+                _teacher_node_on_surface(node, visible_by_id)
+                or _teacher_node_is_reachable_static_part(node)
+            )
         )
         if can_open:
             extra = _reveal_action_extra(node) if node.get("container") else {}
@@ -483,6 +500,14 @@ def _teacher_node_on_surface(node: dict[str, Any], visible_by_id: dict[str, dict
         return False
     target = visible_by_id.get(str(target_id))
     return bool(target and target.get("surface"))
+
+
+def _teacher_node_is_reachable_static_part(node: dict[str, Any]) -> bool:
+    properties = {
+        str(prop).strip().upper().replace(" ", "_")
+        for prop in node.get("properties", [])
+    }
+    return bool(node.get("reachable") and "STATIC" in properties and node.get("part_of") is not None)
 
 
 def _reveal_valid_actions(node: dict[str, Any]) -> list[str]:
@@ -1174,6 +1199,15 @@ class SemanticWorld:
         target = self.states.get(state.location_target)
         return bool(target and target.node.is_surface)
 
+    def _is_reachable_static_part(self, node_id: str) -> bool:
+        state = self.states.get(node_id)
+        return bool(
+            state
+            and self.is_reachable(node_id)
+            and state.node.has_property("STATIC")
+            and self._part_parent(node_id) is not None
+        )
+
     def _current_visible_edges(self, visible_node_ids: set[str]) -> list[dict[str, str]]:
         edges: list[dict[str, str]] = []
         seen: set[tuple[str, str, str]] = set()
@@ -1567,7 +1601,10 @@ class SemanticWorld:
             return self._failure(action, "not_openable", f"{target.node.id} is not openable")
         if not self.is_visible(target.node.id):
             return self._failure(action, "not_visible", f"{target.node.id} is not visible")
-        if not self._is_on_surface(target.node.id):
+        if not (
+            self._is_on_surface(target.node.id)
+            or self._is_reachable_static_part(target.node.id)
+        ):
             return self._failure(action, "not_on_surface", f"{target.node.id} must be on a surface before opening")
         if any(state.held for state in self.states.values()):
             return self._failure(action, "hands_occupied", f"{target.node.id} needs both hands free to open")
@@ -1848,6 +1885,9 @@ class WorldBackend(Protocol):
     def metrics(self, initial_observation: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def close(self) -> None:
+        ...
+
 
 class SymbolicBackend:
     name = "symbolic"
@@ -1875,6 +1915,9 @@ class SymbolicBackend:
 
     def metrics(self, initial_observation: dict[str, Any]) -> dict[str, Any]:
         return self.evaluator.metrics(initial_observation)
+
+    def close(self) -> None:
+        return None
 
 
 class TrajectoryEvaluator:
@@ -2327,6 +2370,7 @@ class SymbolicHarness:
         teacher_policy: TeacherPolicyProtocol | None = None,
         failure_injection: FailureInjectionConfig | None = None,
         placement_edge_constraints: PlacementEdgeConstraints | None = None,
+        backend: WorldBackend | None = None,
     ) -> None:
         if mode not in {"replay", "teacher"}:
             raise ValueError(f"Unsupported collection mode {mode!r}; use replay or teacher")
@@ -2337,14 +2381,20 @@ class SymbolicHarness:
         self.mode = mode
         self.max_steps = max_steps
         self.placement_edge_constraints = placement_edge_constraints or PlacementEdgeConstraints()
-        self.backend: WorldBackend = SymbolicBackend(graph, task, self.placement_edge_constraints)
+        self.backend: WorldBackend = backend or SymbolicBackend(graph, task, self.placement_edge_constraints)
         self.teacher_policy = teacher_policy
         self.failure_injection = failure_injection or FailureInjectionConfig()
         self.failure_rng = random.Random(self.failure_injection.seed)
         self.injected_failure_count = 0
-        self.failed_action_signatures: set[tuple[str, tuple[str, ...]]] = set()
+        self.failed_action_keys: set[tuple[str, ...]] = set()
 
     def run(self) -> dict[str, Any]:
+        try:
+            return self._run()
+        finally:
+            self.backend.close()
+
+    def _run(self) -> dict[str, Any]:
         backend = self.backend
         initial_observation = backend.observe()
         initial_snapshot = backend.snapshot()
@@ -2443,9 +2493,9 @@ class SymbolicHarness:
     def _maybe_inject_failure(self, action: ParsedAction) -> tuple[ParsedAction, dict[str, Any] | None]:
         if not self._should_inject_failure(action):
             return action, None
-        signature = self._action_signature(action)
+        failure_key = self._failure_key(action)
         self.injected_failure_count += 1
-        self.failed_action_signatures.add(signature)
+        self.failed_action_keys.add(failure_key)
         failed_action = ParsedAction(
             name=f"failed_{action.base_name}",
             node_ids=list(action.node_ids),
@@ -2457,6 +2507,8 @@ class SymbolicHarness:
             "original_action": action.to_json(),
             "failed_action": failed_action.to_json(),
             "failure_index": self.injected_failure_count,
+            "deduplication_scope": self.failure_injection.deduplication_scope,
+            "deduplication_key": list(failure_key),
         }
 
     def _should_inject_failure(self, action: ParsedAction) -> bool:
@@ -2469,8 +2521,8 @@ class SymbolicHarness:
             return False
         if self.injected_failure_count >= config.max_failures_per_episode:
             return False
-        signature = self._action_signature(action)
-        if signature in self.failed_action_signatures:
+        failure_key = self._failure_key(action)
+        if failure_key in self.failed_action_keys:
             return False
         if config.mode == "once":
             return self.injected_failure_count == 0
@@ -2480,9 +2532,8 @@ class SymbolicHarness:
             return self.failure_rng.random() < config.probability
         return False
 
-    @staticmethod
-    def _action_signature(action: ParsedAction) -> tuple[str, tuple[str, ...]]:
-        return action.base_name, tuple(action.node_ids)
+    def _failure_key(self, action: ParsedAction) -> tuple[str, ...]:
+        return self.failure_injection.deduplication_key(action.base_name, action.node_ids)
 
 
 def collect_symbolic_trajectories(
@@ -2498,6 +2549,7 @@ def collect_symbolic_trajectories(
     failure_injection: FailureInjectionConfig | None = None,
     placement_edge_constraints_path: str | Path | None = None,
     placement_edge_constraints: PlacementEdgeConstraints | None = None,
+    backend_factory: Callable[[ViewGraph, TaskRecord, PlacementEdgeConstraints], WorldBackend] | None = None,
 ) -> TrajectoryCollectionResult:
     graphs = {graph.scene_id: graph for graph in load_view_graphs_jsonl(view_graph_path)}
     tasks = _load_tasks_jsonl(tasks_path)
@@ -2525,6 +2577,11 @@ def collect_symbolic_trajectories(
                     failure_injection,
                     seed=failure_seed_source.randrange(0, 2**63),
                 )
+            backend = (
+                backend_factory(graph, task, placement_edge_constraints or PlacementEdgeConstraints())
+                if backend_factory is not None
+                else None
+            )
             episode = SymbolicHarness(
                 graph,
                 task,
@@ -2533,6 +2590,7 @@ def collect_symbolic_trajectories(
                 teacher_policy=teacher_policy,
                 failure_injection=episode_failure_injection,
                 placement_edge_constraints=placement_edge_constraints,
+                backend=backend,
             ).run()
             handle.write(json.dumps(episode, ensure_ascii=False) + "\n")
             count += 1

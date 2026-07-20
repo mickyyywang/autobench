@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import base64
+import copy
 import json
+import math
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Callable
 
@@ -21,14 +24,27 @@ from .harness import (
     parse_teacher_decision,
 )
 from .manual_actions import parse_manual_action
-from .models import TaskRecord, ViewGraph
+from .goal import evaluate_goal_expression, normalize_goal_expression
+from .models import TaskRecord, ViewGraph, normalize_relation
 from .placement_constraints import PlacementEdgeConstraints
 
 
-EVAL_MODES = ("obs_only", "graph_only", "obs_plus_graph", "wrong_graph_plus_obs")
+EVAL_MODES = (
+    "obs_only",
+    "visible_graph_only",
+    "graph_only",
+    "obs_plus_graph",
+    "wrong_graph_plus_obs",
+)
 IMAGE_MODES = {"obs_only", "obs_plus_graph", "wrong_graph_plus_obs"}
-GRAPH_MODES = {"graph_only", "obs_plus_graph", "wrong_graph_plus_obs"}
+GRAPH_MODES = {"visible_graph_only", "graph_only", "obs_plus_graph", "wrong_graph_plus_obs"}
 HISTORY_SOURCES = ("teacher", "inference")
+CAPABILITY_METRIC_VERSION = 5
+ACTION_ALIASES = {
+    "pick": "grab",
+    "place_in": "putin",
+    "place_on": "puton",
+}
 OPEN_ACTION_SYSTEM_PROMPT = """You are a policy for high-level embodied task evaluation.
 Choose exactly one semantic action using the action catalog and the provided observation.
 Output strict JSON only."""
@@ -61,6 +77,7 @@ class RealObservationEvalConfig:
     oss_region: str = "cn-shanghai"
     oss_endpoint: str | None = None
     cache_dir: str | Path | None = None
+    soft_optimal_beta: float = 1.0
 
     def __post_init__(self) -> None:
         providers = {
@@ -96,6 +113,8 @@ class RealObservationEvalConfig:
             raise ValueError("max_output_tokens must be positive")
         if self.frame_sampling not in {"head", "previous_tail"}:
             raise ValueError("frame_sampling must be head or previous_tail")
+        if self.soft_optimal_beta <= 0:
+            raise ValueError("soft_optimal_beta must be positive")
 
 
 @dataclass(frozen=True)
@@ -109,6 +128,57 @@ class ReplayStepContext:
     expected_recovery: dict[str, Any]
     generated_valid_actions: list[dict[str, Any]] = field(default_factory=list)
     valid_actions_added: list[dict[str, Any]] = field(default_factory=list)
+    counterfactual_backend: SymbolicBackend | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+
+def _visible_graph_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    """Project symbolic state onto information attributable to the current view."""
+    visible_nodes: list[dict[str, Any]] = []
+    visible_node_ids: set[str] = set()
+    for node in observation.get("visible_nodes", []):
+        if not isinstance(node, dict) or node.get("id") is None:
+            continue
+        node_id = str(node["id"])
+        visible_node_ids.add(node_id)
+        projected = {
+            key: copy.deepcopy(node[key])
+            for key in ("id", "name", "category", "open", "assembled", "pressed", "is_full")
+            if key in node
+        }
+        projected["id"] = node_id
+        visible_nodes.append(projected)
+
+    visible_edges: list[dict[str, Any]] = []
+    for edge in observation.get("visible_edges", []):
+        if not isinstance(edge, dict):
+            continue
+        source = str(edge.get("from") or "")
+        target = str(edge.get("to") or "")
+        relation = str(edge.get("relation") or "")
+        if source in visible_node_ids and target in visible_node_ids and relation:
+            visible_edges.append({"from": source, "to": target, "relation": relation})
+
+    held_objects = [
+        {
+            key: copy.deepcopy(item[key])
+            for key in ("id", "name")
+            if key in item
+        }
+        for item in observation.get("held_objects", [])
+        if isinstance(item, dict) and item.get("id") is not None
+    ]
+    robot = observation.get("robot")
+    hands = robot.get("hands") if isinstance(robot, dict) else None
+    return {
+        "visible_nodes": visible_nodes,
+        "visible_edges": visible_edges,
+        "held_objects": held_objects,
+        "robot": {"hands": copy.deepcopy(hands) if isinstance(hands, dict) else {}},
+    }
 
 
 class RealObservationAdapter:
@@ -178,13 +248,16 @@ class RealObservationAdapter:
                 "recovery": {
                     "required": "true when the current observation shows the previous task action failed and this action corrects its consequences or retries it",
                     "failed_action": "previous task action name when required, otherwise null",
+                    "failed_node_ids": "node_ids of the previous failed action when required, otherwise []; order is ignored for attach and preserved for directional actions",
                 },
                 "action": action_schema,
             },
         }
         if include_valid_actions:
             payload["valid_actions"] = valid_actions
-        if mode in {"graph_only", "obs_plus_graph"}:
+        if mode == "visible_graph_only":
+            payload["current_observation"] = _visible_graph_observation(graph_observation)
+        elif mode in {"graph_only", "obs_plus_graph"}:
             payload["current_observation"] = graph_observation
         elif mode == "wrong_graph_plus_obs":
             payload["current_observation"] = wrong_graph_observation
@@ -314,6 +387,7 @@ class RealTrajectoryHarness:
                     "model_error": None,
                     "score": None,
                     "recovery_score": None,
+                    "capability_scores": None,
                 }
                 if not self.config.dry_run:
                     try:
@@ -335,6 +409,14 @@ class RealTrajectoryHarness:
                                     context.expected_recovery,
                                     predicted_recovery,
                                     decision.parse_error,
+                                ),
+                                "capability_scores": _score_capabilities(
+                                    context,
+                                    predicted,
+                                    predicted_recovery,
+                                    decision.parse_error,
+                                    include_valid_actions=self.config.include_valid_actions,
+                                    soft_optimal_beta=self.config.soft_optimal_beta,
                                 ),
                             }
                         )
@@ -359,6 +441,14 @@ class RealTrajectoryHarness:
                             context.expected_recovery,
                             None,
                             f"model request failed: {exc}",
+                        )
+                        record["capability_scores"] = _score_capabilities(
+                            context,
+                            {},
+                            None,
+                            f"model request failed: {exc}",
+                            include_valid_actions=self.config.include_valid_actions,
+                            soft_optimal_beta=self.config.soft_optimal_beta,
                         )
                 records.append(record)
                 if record_callback is not None:
@@ -495,6 +585,7 @@ def _build_replay_contexts(
                 expected_recovery=expected_recovery,
                 generated_valid_actions=generated_valid_actions,
                 valid_actions_added=valid_actions_added,
+                counterfactual_backend=copy.deepcopy(backend),
             )
         )
         executed_action = _executed_action(step)
@@ -554,7 +645,7 @@ def _expected_recovery(
     history: list[dict[str, Any]],
     expected_action: dict[str, Any],
 ) -> dict[str, Any]:
-    default = {"required": False, "failed_action": None}
+    default = {"required": False, "failed_action": None, "failed_node_ids": []}
     if len(history) < 2:
         return default
     recovery_item = history[-1]
@@ -580,6 +671,11 @@ def _expected_recovery(
     return {
         "required": True,
         "failed_action": failed_name,
+        "failed_node_ids": [
+            str(node_id)
+            for node_id in failed_action.get("node_ids", [])
+            if str(node_id).strip()
+        ],
     }
 
 
@@ -651,7 +747,7 @@ def _predicted_recovery(parsed_response: dict[str, Any] | None) -> dict[str, Any
         return None
     raw = parsed_response.get("recovery")
     if isinstance(raw, bool):
-        return {"required": raw, "failed_action": None}
+        return {"required": raw, "failed_action": None, "failed_node_ids": []}
     if not isinstance(raw, dict) or not isinstance(raw.get("required"), bool):
         return None
     failed_action = raw.get("failed_action")
@@ -662,9 +758,19 @@ def _predicted_recovery(parsed_response: dict[str, Any] | None) -> dict[str, Any
         if failed_action is not None and str(failed_action).strip()
         else None
     )
+    raw_node_ids = raw.get("failed_node_ids", [])
+    if raw_node_ids is None:
+        raw_node_ids = []
+    if not isinstance(raw_node_ids, list):
+        return None
     return {
         "required": raw["required"],
         "failed_action": normalized_failed_action,
+        "failed_node_ids": [
+            str(node_id).strip()
+            for node_id in raw_node_ids
+            if str(node_id).strip()
+        ],
     }
 
 
@@ -702,12 +808,803 @@ def _score_recovery(
         if failed_action_applicable
         else True
     )
+    failed_node_ids_applicable = bool(expected.get("required"))
+    expected_failed_node_ids = list(expected.get("failed_node_ids") or [])
+    predicted_failed_node_ids = (
+        list(predicted.get("failed_node_ids") or [])
+        if parsed
+        else []
+    )
+    attach_failure = (
+        expected.get("failed_action") == "attach"
+        and parsed
+        and predicted.get("failed_action") == "attach"
+    )
+    failed_node_ids_match = (
+        parsed
+        and (
+            sorted(predicted_failed_node_ids) == sorted(expected_failed_node_ids)
+            if attach_failure
+            else predicted_failed_node_ids == expected_failed_node_ids
+        )
+        if failed_node_ids_applicable
+        else True
+    )
     return {
         "parsed": parsed,
         "required": required_match,
         "failed_action": failed_action_match,
+        "failed_node_ids": failed_node_ids_match,
         "full_exact": bool(required_match and failed_action_match),
+        "grounding_exact": bool(
+            required_match and failed_action_match and failed_node_ids_match
+        ),
         "failed_action_applicable": failed_action_applicable,
+        "failed_node_ids_applicable": failed_node_ids_applicable,
+    }
+
+
+def _score_capabilities(
+    context: ReplayStepContext,
+    predicted: dict[str, Any],
+    predicted_recovery: dict[str, Any] | None,
+    parse_error: str | None,
+    *,
+    include_valid_actions: bool,
+    soft_optimal_beta: float,
+) -> dict[str, Any]:
+    parsed = parse_error is None and bool(predicted.get("name")) and (
+        predicted.get("name") != "invalid_teacher_action"
+    )
+    backend = context.counterfactual_backend
+    manual_step = context.step.get("manual_inserted") is True
+    unordered_attach = not include_valid_actions
+    candidate_keys = {
+        _canonical_action_key(
+            action,
+            backend,
+            unordered_attach=unordered_attach,
+        )
+        for action in context.generated_valid_actions
+        if isinstance(action, dict) and action.get("name")
+    }
+    predicted_key = (
+        _canonical_action_key(
+            predicted,
+            backend,
+            unordered_attach=unordered_attach,
+        )
+        if parsed
+        else None
+    )
+    admissibility_eligible = not include_valid_actions and not manual_step
+    soft_score = _soft_optimal_action_score(
+        context,
+        predicted if parsed else {},
+        beta=soft_optimal_beta,
+        unordered_attach=unordered_attach,
+    )
+    recovery_score = _score_recovery(
+        context.expected_recovery,
+        predicted_recovery,
+        parse_error,
+    )
+    exploration = _exploration_step_score(context, predicted if parsed else {})
+    goal_satisfied = _safe_backend_success(backend) if backend is not None else None
+    predicted_stop = bool(
+        parsed and _canonical_action_name(predicted) == "stop"
+    )
+    expected_recovery_required = bool(context.expected_recovery.get("required"))
+    predicted_recovery_required = bool(
+        predicted_recovery is not None and predicted_recovery.get("required") is True
+    )
+    return {
+        "action_selection": {
+            "action_admissibility_rate": {
+                "eligible": admissibility_eligible,
+                "value": (
+                    bool(parsed and predicted_key in candidate_keys)
+                    if admissibility_eligible
+                    else None
+                ),
+                "predicted_key": _action_key_json(predicted_key),
+                "candidate_count": len(candidate_keys),
+                "excluded_reason": (
+                    "valid_actions_were_provided"
+                    if include_valid_actions
+                    else "manual_inserted_step"
+                    if manual_step
+                    else None
+                ),
+            },
+            "soft_optimal_action_score": soft_score,
+        },
+        "failure_recovery": {
+            "recovery_detection_f1": {
+                "eligible": True,
+                "expected_positive": expected_recovery_required,
+                "predicted_positive": predicted_recovery_required,
+            },
+            "recovery_grounding_accuracy": {
+                "eligible": expected_recovery_required,
+                "value": (
+                    bool(recovery_score["grounding_exact"])
+                    if expected_recovery_required
+                    else None
+                ),
+                "expected_failed_action": context.expected_recovery.get("failed_action"),
+                "expected_failed_node_ids": list(
+                    context.expected_recovery.get("failed_node_ids") or []
+                ),
+            },
+        },
+        "active_exploration": exploration,
+        "completion_judgment": {
+            "premature_stop_rate": {
+                "eligible": goal_satisfied is False,
+                "value": predicted_stop if goal_satisfied is False else None,
+            },
+            "completion_stop_recall": {
+                "eligible": goal_satisfied is True,
+                "value": predicted_stop if goal_satisfied is True else None,
+            },
+            "goal_satisfied_before_action": goal_satisfied,
+        },
+    }
+
+
+def _canonical_action_name(action: dict[str, Any]) -> str:
+    name = str(action.get("base_name") or action.get("name") or "").strip().lower()
+    name = name.removeprefix("failed_")
+    return ACTION_ALIASES.get(name, name)
+
+
+def _canonical_action_key(
+    action: dict[str, Any],
+    backend: SymbolicBackend | None = None,
+    *,
+    unordered_attach: bool = False,
+) -> tuple[str, tuple[str, ...]]:
+    node_ids = []
+    for raw_node_id in action.get("node_ids", []) or []:
+        node_id = str(raw_node_id).strip()
+        if backend is not None:
+            node_id = backend.world.resolve_node_id(node_id) or node_id
+        if node_id:
+            node_ids.append(node_id)
+    action_name = _canonical_action_name(action)
+    if unordered_attach and action_name == "attach" and len(node_ids) == 2:
+        node_ids.sort()
+    return action_name, tuple(node_ids)
+
+
+def _action_key_json(
+    key: tuple[str, tuple[str, ...]] | None,
+) -> dict[str, Any] | None:
+    if key is None:
+        return None
+    return {"name": key[0], "node_ids": list(key[1])}
+
+
+def _canonical_action_payload(
+    action: dict[str, Any],
+    backend: SymbolicBackend,
+) -> dict[str, Any]:
+    key = _canonical_action_key(action, backend)
+    payload: dict[str, Any] = {"name": key[0], "node_ids": list(key[1])}
+    if isinstance(action.get("arguments"), dict):
+        payload["arguments"] = dict(action["arguments"])
+    return payload
+
+
+def _soft_optimal_action_score(
+    context: ReplayStepContext,
+    predicted: dict[str, Any],
+    *,
+    beta: float,
+    unordered_attach: bool,
+) -> dict[str, Any]:
+    backend = context.counterfactual_backend
+    if backend is None:
+        return {
+            "eligible": False,
+            "value": None,
+            "excluded_reason": "counterfactual_state_unavailable",
+        }
+    if context.step.get("manual_inserted") is True:
+        return {
+            "eligible": False,
+            "value": None,
+            "excluded_reason": "manual_inserted_step",
+        }
+
+    candidates: dict[tuple[str, tuple[str, ...]], dict[str, Any]] = {}
+    for action in context.generated_valid_actions:
+        if not isinstance(action, dict) or not action.get("name"):
+            continue
+        key = _canonical_action_key(
+            action,
+            backend,
+            unordered_attach=unordered_attach,
+        )
+        candidates.setdefault(key, action)
+    if not candidates:
+        return {
+            "eligible": False,
+            "value": None,
+            "excluded_reason": "no_internal_candidates",
+        }
+
+    candidate_costs = []
+    executable_costs: dict[tuple[str, tuple[str, ...]], float] = {}
+    for key, action in candidates.items():
+        event, _, cost = _simulate_action(backend, action)
+        executable = event.get("status") == "success"
+        if executable:
+            executable_costs[key] = cost
+        candidate_costs.append(
+            {
+                "action": _action_key_json(key),
+                "executable": executable,
+                "planning_cost": cost if executable else None,
+                "relaxed_completion_cost": cost if executable else None,
+                "failure_type": event.get("failure_type") if not executable else None,
+            }
+        )
+    if not executable_costs:
+        return {
+            "eligible": False,
+            "value": None,
+            "excluded_reason": "no_executable_candidates",
+            "candidate_costs": candidate_costs,
+        }
+
+    predicted_key = (
+        _canonical_action_key(
+            predicted,
+            backend,
+            unordered_attach=unordered_attach,
+        )
+        if predicted
+        else None
+    )
+    best_cost = min(executable_costs.values())
+    predicted_cost = executable_costs.get(predicted_key) if predicted_key is not None else None
+    value = (
+        math.exp(-beta * (predicted_cost - best_cost))
+        if predicted_cost is not None
+        else 0.0
+    )
+    return {
+        "eligible": True,
+        "value": value,
+        "beta": beta,
+        "planning_cost_before": _planning_completion_cost(backend),
+        "best_planning_cost_after": best_cost,
+        "predicted_planning_cost_after": predicted_cost,
+        # Backward-compatible aliases. Soft optimality has always used a
+        # one-step planning heuristic rather than direct goal-fact progress.
+        "relaxed_completion_cost_before": _planning_completion_cost(backend),
+        "best_relaxed_completion_cost_after": best_cost,
+        "predicted_relaxed_completion_cost_after": predicted_cost,
+        "predicted_executable": predicted_cost is not None,
+        "candidate_count": len(candidates),
+        "executable_candidate_count": len(executable_costs),
+        "candidate_costs": candidate_costs,
+    }
+
+
+def _simulate_action(
+    backend: SymbolicBackend,
+    action: dict[str, Any],
+) -> tuple[dict[str, Any], SymbolicBackend, float]:
+    trial = copy.deepcopy(backend)
+    payload = _canonical_action_payload(action, trial)
+    if not payload["name"]:
+        return (
+            {"status": "failure", "failure_type": "missing_action_name"},
+            trial,
+            _planning_completion_cost(trial),
+        )
+    event = trial.step(_parsed_action(payload))
+    return event, trial, _planning_completion_cost(trial)
+
+
+def _safe_backend_success(backend: SymbolicBackend | None) -> bool | None:
+    if backend is None:
+        return None
+    try:
+        expression = _metric_goal_expression(
+            backend.evaluator.task.task_completion_criterion
+        )
+        if expression is not None and expression != "":
+            return bool(
+                evaluate_goal_expression(
+                    expression,
+                    backend.evaluator._predicate_met,
+                ).success
+            )
+        return bool(backend.success())
+    except Exception:  # noqa: BLE001 - malformed goals remain auditable via relaxed cost.
+        return None
+
+
+def _relaxed_completion_cost(backend: SymbolicBackend) -> float:
+    """Return direct goal-fact deficit without access prerequisites.
+
+    This cost drives normalized goal progress and intervention progress windows.
+    Use `_planning_completion_cost` when ranking executable next actions.
+    """
+    return _completion_cost(backend, include_prerequisites=False)
+
+
+def _planning_completion_cost(backend: SymbolicBackend) -> float:
+    """Estimate remaining goal actions plus deduplicated access prerequisites."""
+    return _completion_cost(backend, include_prerequisites=True)
+
+
+def _completion_cost(
+    backend: SymbolicBackend,
+    *,
+    include_prerequisites: bool,
+) -> float:
+    expression = _metric_goal_expression(
+        backend.evaluator.task.task_completion_criterion
+    )
+    if expression is None or expression == "":
+        success = _safe_backend_success(backend)
+        return 0.0 if success else 1.0
+    try:
+        return float(
+            _expression_completion_cost(
+                expression,
+                backend,
+                include_prerequisites=include_prerequisites,
+            )
+        )
+    except Exception:  # noqa: BLE001 - fall back to a conservative binary heuristic.
+        success = _safe_backend_success(backend)
+        return 0.0 if success else 1.0
+
+
+def _expression_completion_cost(
+    expression: Any,
+    backend: SymbolicBackend,
+    *,
+    include_prerequisites: bool = False,
+) -> float:
+    expression = normalize_goal_expression(expression)
+    if isinstance(expression, dict):
+        if "and" in expression:
+            return sum(
+                _expression_completion_cost(
+                    item,
+                    backend,
+                    include_prerequisites=include_prerequisites,
+                )
+                for item in _as_expression_list(expression["and"])
+            )
+        if "or" in expression:
+            costs = [
+                _expression_completion_cost(
+                    item,
+                    backend,
+                    include_prerequisites=include_prerequisites,
+                )
+                for item in _as_expression_list(expression["or"])
+            ]
+            return min(costs) if costs else 1.0
+        if "not" in expression:
+            return 0.0 if _expression_met(expression, backend) else 1.0
+        if "predicate" in expression:
+            return _atomic_completion_cost(
+                str(expression["predicate"]),
+                _as_expression_list(
+                    expression.get("args", expression.get("arguments", []))
+                ),
+                backend,
+                include_prerequisites=include_prerequisites,
+            )
+        if "final" in expression:
+            return _expression_completion_cost(
+                expression["final"],
+                backend,
+                include_prerequisites=include_prerequisites,
+            )
+    if isinstance(expression, list):
+        if not expression:
+            return 1.0
+        head = normalize_relation(str(expression[0])) if isinstance(expression[0], str) else ""
+        if head == "AND":
+            return sum(
+                _expression_completion_cost(
+                    item,
+                    backend,
+                    include_prerequisites=include_prerequisites,
+                )
+                for item in expression[1:]
+            )
+        if head == "OR":
+            costs = [
+                _expression_completion_cost(
+                    item,
+                    backend,
+                    include_prerequisites=include_prerequisites,
+                )
+                for item in expression[1:]
+            ]
+            return min(costs) if costs else 1.0
+        if head == "NOT":
+            return 0.0 if _expression_met(expression, backend) else 1.0
+        if head:
+            return _atomic_completion_cost(
+                head,
+                list(expression[1:]),
+                backend,
+                include_prerequisites=include_prerequisites,
+            )
+        return sum(
+            _expression_completion_cost(
+                item,
+                backend,
+                include_prerequisites=include_prerequisites,
+            )
+            for item in expression
+        )
+    return 0.0 if _expression_met(expression, backend) else 1.0
+
+
+def _expression_met(expression: Any, backend: SymbolicBackend) -> bool:
+    try:
+        return bool(
+            evaluate_goal_expression(
+                expression,
+                backend.evaluator._predicate_met,
+            ).success
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _atomic_completion_cost(
+    predicate: str,
+    args: list[Any],
+    backend: SymbolicBackend,
+    *,
+    include_prerequisites: bool = False,
+) -> float:
+    predicate = normalize_relation(predicate)
+    if backend.evaluator._predicate_met(predicate, args):
+        return 0.0
+    world = backend.world
+
+    if predicate in {"ON", "INSIDE", "IN"} and len(args) >= 2:
+        object_id = world.resolve_node_id(args[0])
+        target_id = world.resolve_node_id(args[1])
+        if object_id is None or target_id is None:
+            return 1.0
+        if not include_prerequisites:
+            return 1.0
+        object_state = world.states[object_id]
+        target_state = world.states[target_id]
+        cost = 1.0  # final putin/puton
+        requirements: set[tuple[str, str]] = set()
+        if not object_state.held:
+            cost += 1.0  # grab
+            requirements.update(_access_resolution_requirements(world, object_id))
+        requirements.update(_access_resolution_requirements(world, target_id))
+        if predicate in {"INSIDE", "IN"}:
+            if target_state.node.is_openable and not target_state.open:
+                requirements.add(("open", target_id))
+            if world._container_is_full(target_id, exclude={object_id}):
+                cost += 1.0
+        return cost + float(len(requirements))
+
+    if predicate == "ASSEMBLED" and args:
+        parent_id = world.resolve_node_id(args[0])
+        if parent_id is None:
+            return 1.0
+        parts = world._direct_part_ids(parent_id)
+        unattached = [
+            part_id
+            for part_id in parts
+            if world.states[part_id].attached_to is None
+        ]
+        direct_attach_cost = 1.0
+        if not include_prerequisites:
+            return direct_attach_cost
+        requirements: set[tuple[str, str]] = set()
+        for part_id in unattached or parts:
+            requirements.update(_access_resolution_requirements(world, part_id))
+        return direct_attach_cost + float(len(requirements))
+
+    if predicate == "ATTACHED" and args:
+        if not include_prerequisites:
+            return 1.0
+        requirements: set[tuple[str, str]] = set()
+        for argument in args:
+            node_id = world.resolve_node_id(argument)
+            if node_id is not None:
+                requirements.update(_access_resolution_requirements(world, node_id))
+        return 1.0 + float(len(requirements))
+
+    if predicate in {"OPEN", "CLOSED", "HELD", "VISIBLE", "REACHABLE", "MOVED_ASIDE", "CLEARED", "INSPECTED"} and args:
+        node_id = world.resolve_node_id(args[0])
+        if node_id is None:
+            return 1.0
+        if not include_prerequisites:
+            return 1.0
+        return 1.0 + _access_resolution_cost(world, node_id)
+
+    if predicate == "PRESSED_TIMES" and len(args) >= 2:
+        node_id = world.resolve_node_id(args[0])
+        required = _required_count(args[1])
+        if node_id is None or required is None:
+            return 1.0
+        current = backend.evaluator._successful_action_count("press", node_id)
+        return float(max(0, required - current))
+
+    if predicate == "ACTION_COUNT" and len(args) >= 3:
+        action_name = _canonical_action_name({"name": str(args[0])})
+        node_id = world.resolve_node_id(args[1])
+        required = _required_count(args[2])
+        if node_id is None or required is None:
+            return 1.0
+        current = backend.evaluator._successful_action_count(action_name, node_id)
+        return float(max(0, required - current))
+
+    if predicate == "PRESSED_SEQUENCE" and args:
+        raw_sequence = args[0] if len(args) == 1 and isinstance(args[0], list) else args
+        expected = [world.resolve_node_id(item) for item in raw_sequence]
+        if any(item is None for item in expected):
+            return 1.0
+        current = backend.evaluator._successful_press_sequence()
+        prefix_length = 0
+        for actual, wanted in zip(current, expected):
+            if actual != wanted:
+                break
+            prefix_length += 1
+        return float(max(0, len(expected) - prefix_length))
+
+    if predicate in {"AT_MOST_INSIDE", "CONTAINS_AT_MOST", "MAX_ITEMS"} and len(args) >= 2:
+        container_id = world.resolve_node_id(args[0])
+        limit = _required_count(args[1])
+        if container_id is None or limit is None:
+            return 1.0
+        return float(max(0, world._container_item_count(container_id) - limit))
+
+    return 1.0
+
+
+def _access_resolution_cost(world: Any, node_id: str) -> float:
+    return float(len(_access_resolution_requirements(world, node_id)))
+
+
+def _access_resolution_requirements(
+    world: Any,
+    node_id: str,
+) -> set[tuple[str, str]]:
+    requirements: set[tuple[str, str]] = set()
+    for blocker_id in world._active_blockers(node_id):
+        resolution_action = "move_aside"
+        for edge in world.active_occlusion_edges:
+            if edge[0] == blocker_id and edge[1] == node_id:
+                resolution_action = world._occlusion_edge_resolution_action(edge)
+                break
+        requirements.add((resolution_action, blocker_id))
+    requirements.update(("open", ancestor_id) for ancestor_id in _closed_ancestor_ids(world, node_id))
+    memory_anchor = world.memory_hidden.get(node_id)
+    if memory_anchor is not None and not world._memory_target_revealed(memory_anchor):
+        anchor = world.states.get(memory_anchor)
+        if anchor is not None and anchor.node.is_openable and not anchor.open:
+            requirements.add(("open", memory_anchor))
+        elif anchor is not None and anchor.node.is_movable:
+            requirements.add(("move_aside", memory_anchor))
+        else:
+            requirements.add(("inspect", memory_anchor))
+    return requirements
+
+
+def _closed_ancestor_ids(world: Any, node_id: str) -> list[str]:
+    closed = []
+    seen: set[str] = set()
+    current = node_id
+    while current in world.states and current not in seen:
+        seen.add(current)
+        state = world.states[current]
+        parent_id = state.location_target
+        if parent_id is None or parent_id not in world.states:
+            break
+        parent = world.states[parent_id]
+        if state.location_relation == "INSIDE" and parent.node.is_openable and not parent.open:
+            closed.append(parent_id)
+        current = parent_id
+    return closed
+
+
+def _required_count(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_expression_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def _goal_atoms(expression: Any) -> list[tuple[str, list[Any]]]:
+    expression = _metric_goal_expression(expression)
+    atoms: list[tuple[str, list[Any]]] = []
+
+    def visit(item: Any) -> None:
+        item = normalize_goal_expression(item)
+        if isinstance(item, dict):
+            if "predicate" in item:
+                atoms.append(
+                    (
+                        normalize_relation(str(item["predicate"])),
+                        _as_expression_list(item.get("args", item.get("arguments", []))),
+                    )
+                )
+                return
+            for key in ("and", "or", "all", "any"):
+                if key in item:
+                    for child in _as_expression_list(item[key]):
+                        visit(child)
+            if "not" in item:
+                visit(item["not"])
+            if "final" in item:
+                visit(item["final"])
+            return
+        if isinstance(item, list):
+            if item and isinstance(item[0], str):
+                head = normalize_relation(item[0])
+                if head in {"AND", "OR"}:
+                    for child in item[1:]:
+                        visit(child)
+                elif head == "NOT":
+                    if len(item) > 1:
+                        visit(item[1])
+                else:
+                    atoms.append((head, list(item[1:])))
+                return
+            for child in item:
+                visit(child)
+
+    visit(expression)
+    return atoms
+
+
+def _metric_goal_expression(criterion: Any) -> Any:
+    atoms = []
+    if isinstance(criterion, str):
+        for match in re.finditer(r"([A-Za-z_]+)\s*\(([^)]*)\)", criterion):
+            predicate = normalize_relation(match.group(1))
+            args = [
+                item.strip()
+                for item in match.group(2).split(",")
+                if item.strip()
+            ]
+            atoms.append([predicate, *args])
+    if atoms:
+        if len(atoms) == 1:
+            return atoms[0]
+        return {"and": atoms}
+    return normalize_goal_expression(criterion)
+
+
+def _goal_relevant_node_ids(backend: SymbolicBackend) -> set[str]:
+    relevant: set[str] = set()
+
+    def resolve_arg(value: Any) -> None:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                resolve_arg(item)
+            return
+        node_id = backend.world.resolve_node_id(value)
+        if node_id is not None:
+            world = backend.world
+            state = world.states.get(node_id)
+            part_ids = world._direct_part_ids(node_id)
+            if (
+                state is not None
+                and not state.assembled
+                and world._is_decomposed_parent(node_id)
+                and part_ids
+            ):
+                # Before a decomposed goal object can become visible/assembled,
+                # its parts are the observable prerequisites.  Treat the parts
+                # as goal-relevant exploration targets instead of the invisible
+                # virtual parent, which cannot itself be revealed by open or
+                # move_aside.
+                relevant.update(part_ids)
+            else:
+                relevant.add(node_id)
+
+    for _, args in _goal_atoms(backend.evaluator.task.task_completion_criterion):
+        for arg in args:
+            resolve_arg(arg)
+    return relevant
+
+
+def _exploration_obligations(
+    backend: SymbolicBackend,
+) -> tuple[set[str], set[str]]:
+    world = backend.world
+    relevant = _goal_relevant_node_ids(backend)
+    hidden = {node_id for node_id in relevant if not world.is_visible(node_id)}
+    obligations: set[str] = set()
+    for node_id in hidden:
+        for blocker_id in world._active_blockers(node_id):
+            resolution = "move_aside"
+            for edge in world.active_occlusion_edges:
+                if edge[0] == blocker_id and edge[1] == node_id:
+                    resolution = world._occlusion_edge_resolution_action(edge)
+                    break
+            if resolution in {"open", "move_aside"}:
+                obligations.add(f"{resolution}:{blocker_id}")
+        for container_id in _closed_ancestor_ids(world, node_id):
+            obligations.add(f"open:{container_id}")
+        memory_anchor = world.memory_hidden.get(node_id)
+        if memory_anchor is not None and not world._memory_target_revealed(memory_anchor):
+            anchor = world.states.get(memory_anchor)
+            if anchor is not None:
+                if anchor.node.is_openable and not anchor.open:
+                    obligations.add(f"open:{memory_anchor}")
+                elif anchor.node.is_movable:
+                    obligations.add(f"move_aside:{memory_anchor}")
+    return obligations, hidden
+
+
+def _exploration_step_score(
+    context: ReplayStepContext,
+    predicted: dict[str, Any],
+) -> dict[str, Any]:
+    backend = context.counterfactual_backend
+    if backend is None:
+        return {
+            "exploration_opportunity_recall": {
+                "eligible": False,
+                "opportunity_ids": [],
+                "handled_opportunity_ids": [],
+            },
+            "normalized_goal_information_gain": {
+                "eligible": False,
+                "hidden_goal_node_ids": [],
+                "revealed_goal_node_ids": [],
+            },
+        }
+    obligations, hidden = _exploration_obligations(backend)
+    action_name, node_ids = _canonical_action_key(predicted, backend)
+    handled: set[str] = set()
+    revealed: set[str] = set()
+    if action_name in {"open", "move_aside"} and node_ids:
+        opportunity_id = f"{action_name}:{node_ids[0]}"
+        event, trial, _ = _simulate_action(backend, predicted)
+        if event.get("status") == "success":
+            if opportunity_id in obligations:
+                handled.add(opportunity_id)
+            revealed = {
+                node_id
+                for node_id in hidden
+                if trial.world.is_visible(node_id)
+            }
+    return {
+        "exploration_opportunity_recall": {
+            "eligible": bool(obligations),
+            "opportunity_ids": sorted(obligations),
+            "handled_opportunity_ids": sorted(handled),
+        },
+        "normalized_goal_information_gain": {
+            "eligible": bool(hidden),
+            "hidden_goal_node_ids": sorted(hidden),
+            "revealed_goal_node_ids": sorted(revealed),
+        },
     }
 
 
@@ -726,12 +1623,17 @@ def _evaluation_summary(
             for record in mode_records
             if isinstance(record.get("recovery_score"), dict)
         ]
-        by_mode[mode] = _aggregate_scores(
+        teacher_imitation = _aggregate_scores(
             scored,
             recovery_scores=recovery_scored,
             record_count=len(mode_records),
             model_error_count=sum(record.get("model_error") is not None for record in mode_records),
         )
+        by_mode[mode] = {
+            **teacher_imitation,
+            "teacher_imitation": teacher_imitation,
+            "capabilities": _aggregate_capability_scores(mode_records),
+        }
     return {
         "dry_run": config.dry_run,
         "model_name": _evaluation_model_name(config),
@@ -745,6 +1647,20 @@ def _evaluation_summary(
         "frame_sampling": config.frame_sampling,
         "observation_window_seconds": config.observation_window_seconds,
         "frames_per_camera": config.frame_count,
+        "capability_metric_version": CAPABILITY_METRIC_VERSION,
+        "cost_semantics": {
+            "goal_completion_cost": "direct_goal_fact_deficit_without_access_prerequisites",
+            "planning_cost": (
+                "goal_actions_plus_deduplicated_open_move_aside_and_access_prerequisites"
+            ),
+            "soft_optimal_cost": "planning_cost",
+        },
+        "counterfactual_scope": "one_step_from_gold_replay_state",
+        "soft_optimal_beta": config.soft_optimal_beta,
+        "capabilities": {
+            mode: by_mode[mode]["capabilities"]
+            for mode in config.modes
+        },
         "by_mode": by_mode,
     }
 
@@ -771,6 +1687,9 @@ def _aggregate_scores(
     target_scores = [score for score in scores if score["target_applicable"]]
     recovery_failed_action_scores = [
         score for score in recovery_scores if score["failed_action_applicable"]
+    ]
+    recovery_grounding_scores = [
+        score for score in recovery_scores if score.get("failed_node_ids_applicable")
     ]
     paired_scores = list(zip(scores, recovery_scores))
 
@@ -800,6 +1719,10 @@ def _aggregate_scores(
             sum(bool(score["failed_action"]) for score in recovery_failed_action_scores),
             len(recovery_failed_action_scores),
         ),
+        "recovery_grounding_accuracy": ratio(
+            sum(bool(score.get("grounding_exact")) for score in recovery_grounding_scores),
+            len(recovery_grounding_scores),
+        ),
         "recovery_exact_accuracy": ratio(
             sum(bool(score["full_exact"]) for score in recovery_scores),
             len(recovery_scores),
@@ -808,6 +1731,149 @@ def _aggregate_scores(
             sum(bool(action["full_exact"] and recovery["full_exact"]) for action, recovery in paired_scores),
             len(paired_scores),
         ),
+    }
+
+
+def _aggregate_capability_scores(records: list[dict[str, Any]]) -> dict[str, Any]:
+    capability_records = [
+        record
+        for record in records
+        if isinstance(record.get("capability_scores"), dict)
+    ]
+
+    def metric_items(dimension: str, metric: str) -> list[dict[str, Any]]:
+        items = []
+        for record in capability_records:
+            dimension_payload = record["capability_scores"].get(dimension)
+            item = dimension_payload.get(metric) if isinstance(dimension_payload, dict) else None
+            if isinstance(item, dict):
+                items.append(item)
+        return items
+
+    def eligible_values(dimension: str, metric: str) -> list[float]:
+        values = []
+        for item in metric_items(dimension, metric):
+            if item.get("eligible") and item.get("value") is not None:
+                values.append(float(item["value"]))
+        return values
+
+    def mean(values: list[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
+    admissibility = eligible_values(
+        "action_selection",
+        "action_admissibility_rate",
+    )
+    soft_optimal = eligible_values(
+        "action_selection",
+        "soft_optimal_action_score",
+    )
+
+    detection_items = metric_items(
+        "failure_recovery",
+        "recovery_detection_f1",
+    )
+    true_positive = sum(
+        item.get("expected_positive") is True
+        and item.get("predicted_positive") is True
+        for item in detection_items
+    )
+    false_positive = sum(
+        item.get("expected_positive") is False
+        and item.get("predicted_positive") is True
+        for item in detection_items
+    )
+    false_negative = sum(
+        item.get("expected_positive") is True
+        and item.get("predicted_positive") is False
+        for item in detection_items
+    )
+    f1_denominator = 2 * true_positive + false_positive + false_negative
+    recovery_detection_f1 = (
+        2 * true_positive / f1_denominator
+        if f1_denominator
+        else None
+    )
+    recovery_grounding = eligible_values(
+        "failure_recovery",
+        "recovery_grounding_accuracy",
+    )
+
+    episode_groups: dict[tuple[str, str], dict[str, set[str]]] = {}
+    for record in capability_records:
+        episode_key = (
+            str(record.get("source_file") or ""),
+            str(record.get("episode_id") or ""),
+        )
+        group = episode_groups.setdefault(
+            episode_key,
+            {
+                "opportunities": set(),
+                "handled": set(),
+                "hidden": set(),
+                "revealed": set(),
+            },
+        )
+        exploration = record["capability_scores"].get("active_exploration")
+        if not isinstance(exploration, dict):
+            continue
+        opportunity = exploration.get("exploration_opportunity_recall")
+        information = exploration.get("normalized_goal_information_gain")
+        if isinstance(opportunity, dict):
+            group["opportunities"].update(opportunity.get("opportunity_ids") or [])
+            group["handled"].update(opportunity.get("handled_opportunity_ids") or [])
+        if isinstance(information, dict):
+            group["hidden"].update(information.get("hidden_goal_node_ids") or [])
+            group["revealed"].update(information.get("revealed_goal_node_ids") or [])
+    exploration_episode_scores = [
+        len(group["handled"] & group["opportunities"]) / len(group["opportunities"])
+        for group in episode_groups.values()
+        if group["opportunities"]
+    ]
+    information_episode_scores = [
+        len(group["revealed"] & group["hidden"]) / len(group["hidden"])
+        for group in episode_groups.values()
+        if group["hidden"]
+    ]
+
+    premature_stop = eligible_values(
+        "completion_judgment",
+        "premature_stop_rate",
+    )
+    completion_stop = eligible_values(
+        "completion_judgment",
+        "completion_stop_recall",
+    )
+    return {
+        "action_selection": {
+            "action_admissibility_rate": mean(admissibility),
+            "soft_optimal_action_score": mean(soft_optimal),
+        },
+        "failure_recovery": {
+            "recovery_detection_f1": recovery_detection_f1,
+            "recovery_grounding_accuracy": mean(recovery_grounding),
+        },
+        "active_exploration": {
+            "exploration_opportunity_recall": mean(exploration_episode_scores),
+            "normalized_goal_information_gain": mean(information_episode_scores),
+        },
+        "completion_judgment": {
+            "premature_stop_rate": mean(premature_stop),
+            "completion_stop_recall": mean(completion_stop),
+        },
+        "diagnostics": {
+            "capability_scored_record_count": len(capability_records),
+            "action_admissibility_opportunity_count": len(admissibility),
+            "soft_optimal_action_opportunity_count": len(soft_optimal),
+            "recovery_true_positive": true_positive,
+            "recovery_false_positive": false_positive,
+            "recovery_false_negative": false_negative,
+            "recovery_grounding_opportunity_count": len(recovery_grounding),
+            "exploration_episode_count": len(exploration_episode_scores),
+            "information_gain_episode_count": len(information_episode_scores),
+            "premature_stop_opportunity_count": len(premature_stop),
+            "completion_stop_opportunity_count": len(completion_stop),
+        },
     }
 
 
