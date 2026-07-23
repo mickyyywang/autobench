@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
+import json
 import os
 import sys
 import time
 from typing import Any, Callable, Protocol
 from urllib.parse import quote
 
-from openai import APITimeoutError, OpenAI, RateLimitError
+from openai import APITimeoutError, AuthenticationError, OpenAI, RateLimitError
 import requests
 
 
@@ -26,6 +27,8 @@ class BrainPolicyConfig:
     retry_max_seconds: float = 60.0
     api_style: str = "chat_completions"
     max_output_tokens: int = 2048
+    json_response_format: bool = True
+    google_thinking_level: str | None = "low"
 
 
 @dataclass(frozen=True)
@@ -84,7 +87,12 @@ class BrainPolicy:
             raise ValueError("max_attempts must be positive")
         if config.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
+        if config.google_thinking_level not in {None, "minimal", "low", "medium", "high"}:
+            raise ValueError(
+                "google_thinking_level must be minimal, low, medium, high, or None"
+            )
         self.config = config
+        self.last_response_metadata: dict[str, Any] | None = None
         env_name = config.api_key_env or (
             "DASHSCOPE_API_KEY"
             if config.provider == "qwen"
@@ -118,6 +126,7 @@ class BrainPolicy:
             )
 
     def complete(self, request: BrainRequest) -> str:
+        self.last_response_metadata = None
         if self.config.api_style == "anthropic_messages":
             return self._complete_anthropic(request)
         if self.config.api_style == "gemini_generate_content":
@@ -133,18 +142,24 @@ class BrainPolicy:
                 "model": self.config.model,
                 "messages": request.messages,
                 "temperature": self.config.temperature,
-                "response_format": {"type": "json_object"},
             }
+            if self.config.json_response_format:
+                kwargs["response_format"] = {"type": "json_object"}
             if self.config.provider == "qwen":
                 kwargs["extra_body"] = {"enable_thinking": False}
         completion = None
+        response_attempts: list[dict[str, Any]] = []
+        responses_output_token_cap = (
+            self.config.max_output_tokens * 2
+            if self.config.api_style == "responses"
+            else self.config.max_output_tokens
+        )
         for attempt in range(1, self.config.max_attempts + 1):
             try:
                 if self.config.api_style == "responses":
                     completion = self.client.responses.create(**kwargs)
                 else:
                     completion = self.client.chat.completions.create(**kwargs)
-                break
             except RateLimitError as exc:
                 if attempt >= self.config.max_attempts:
                     raise RuntimeError(f"{self.config.provider} brain API request failed: {exc}") from exc
@@ -159,20 +174,106 @@ class BrainPolicy:
                     flush=True,
                 )
                 time.sleep(delay)
+                completion = None
+                continue
             except (TimeoutError, APITimeoutError) as exc:
-                raise RuntimeError(
-                    f"{self.config.provider} brain API request timed out after "
-                    f"{self.config.timeout_seconds} seconds."
-                ) from exc
+                if attempt >= self.config.max_attempts:
+                    raise RuntimeError(
+                        f"{self.config.provider} brain API request timed out after "
+                        f"{self.config.timeout_seconds} seconds on attempt {attempt}/"
+                        f"{self.config.max_attempts}."
+                    ) from exc
+                delay = min(
+                    self.config.retry_backoff_seconds * (2 ** (attempt - 1)),
+                    self.config.retry_max_seconds,
+                )
+                print(
+                    f"{self.config.provider} brain API request timed out; retrying "
+                    f"attempt {attempt + 1}/{self.config.max_attempts} in {delay:g}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                completion = None
+                continue
+            except AuthenticationError as exc:
+                transient_ak_lookup_failure = (
+                    self.config.provider == "mr_openai"
+                    and "AK查询失败" in str(exc)
+                )
+                if not transient_ak_lookup_failure or attempt >= self.config.max_attempts:
+                    raise RuntimeError(
+                        f"{self.config.provider} brain API request failed: {exc}"
+                    ) from exc
+                delay = min(
+                    self.config.retry_backoff_seconds * (2 ** (attempt - 1)),
+                    self.config.retry_max_seconds,
+                )
+                print(
+                    f"{self.config.provider} gateway AK lookup failed; retrying "
+                    f"attempt {attempt + 1}/{self.config.max_attempts} in {delay:g}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                completion = None
+                continue
             except Exception as exc:
                 raise RuntimeError(f"{self.config.provider} brain API request failed: {exc}") from exc
+            if self.config.api_style != "responses":
+                break
+
+            content = _responses_output_text(completion)
+            attempt_metadata = _responses_attempt_metadata(
+                completion,
+                attempt=attempt,
+                requested_max_output_tokens=int(kwargs["max_output_tokens"]),
+                content_length=len(content),
+            )
+            response_attempts.append(attempt_metadata)
+            self.last_response_metadata = {
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "attempts": response_attempts,
+            }
+            if content:
+                return content
+            if attempt >= self.config.max_attempts:
+                diagnostic = json.dumps(
+                    response_attempts[-1],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                raise RuntimeError(
+                    f"{self.config.provider} Responses API returned empty output text "
+                    f"after {attempt} attempt(s); last response metadata: {diagnostic}"
+                )
+            incomplete_details = attempt_metadata.get("incomplete_details")
+            incomplete_reason = (
+                incomplete_details.get("reason")
+                if isinstance(incomplete_details, dict)
+                else None
+            )
+            if incomplete_reason == "max_output_tokens":
+                current_max_output_tokens = int(kwargs["max_output_tokens"])
+                kwargs["max_output_tokens"] = min(
+                    current_max_output_tokens * 2,
+                    responses_output_token_cap,
+                )
+            delay = min(
+                self.config.retry_backoff_seconds * (2 ** (attempt - 1)),
+                self.config.retry_max_seconds,
+            )
+            print(
+                f"{self.config.provider} Responses API returned empty output text; "
+                f"retrying attempt {attempt + 1}/{self.config.max_attempts} in {delay:g}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+            completion = None
         if completion is None:
             raise RuntimeError(f"{self.config.provider} brain API request did not complete")
-        if self.config.api_style == "responses":
-            content = _responses_output_text(completion)
-            if not content:
-                raise RuntimeError(f"{self.config.provider} Responses API returned empty output text")
-            return content
         if not completion.choices:
             raise RuntimeError(f"{self.config.provider} brain API returned no choices")
         content = completion.choices[0].message.content
@@ -207,42 +308,93 @@ class BrainPolicy:
 
     def _complete_google(self, request: BrainRequest) -> str:
         system, contents = _google_contents(request.messages)
-        payload: dict[str, Any] = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": self.config.temperature,
-                "maxOutputTokens": self.config.max_output_tokens,
-                "responseMimeType": "application/json",
-            },
-        }
-        if system:
-            payload["systemInstruction"] = {"parts": [{"text": system}]}
         endpoint = _google_endpoint(str(self.base_url), self.config.model)
-        response = self._post_json(
-            endpoint,
-            payload,
-            headers={"x-goog-api-key": self.api_key.strip()},
-        )
-        texts: list[str] = []
-        for candidate in response.get("candidates", []):
-            if not isinstance(candidate, dict):
+        max_output_tokens = self.config.max_output_tokens
+        attempts: list[dict[str, Any]] = []
+        final_content = ""
+        final_response: dict[str, Any] = {}
+        for semantic_attempt in range(1, 3):
+            generation_config: dict[str, Any] = {
+                "temperature": self.config.temperature,
+                "maxOutputTokens": max_output_tokens,
+                "responseMimeType": "application/json",
+                "responseJsonSchema": _google_response_json_schema(),
+            }
+            if (
+                self.config.google_thinking_level is not None
+                and self.config.model.lower().startswith("gemini-3")
+            ):
+                generation_config["thinkingConfig"] = {
+                    "thinkingLevel": self.config.google_thinking_level
+                }
+            payload: dict[str, Any] = {
+                "contents": contents,
+                "generationConfig": generation_config,
+            }
+            if system:
+                payload["systemInstruction"] = {"parts": [{"text": system}]}
+            response = self._post_json(
+                endpoint,
+                payload,
+                headers={"x-goog-api-key": self.api_key.strip()},
+            )
+            final_response = response
+            candidates = [
+                candidate
+                for candidate in response.get("candidates", [])
+                if isinstance(candidate, dict)
+            ]
+            finish_reasons = [
+                str(candidate.get("finishReason") or "")
+                for candidate in candidates
+                if candidate.get("finishReason") is not None
+            ]
+            finish_messages = [
+                str(candidate.get("finishMessage") or "")
+                for candidate in candidates
+                if candidate.get("finishMessage") is not None
+            ]
+            texts: list[str] = []
+            for candidate in candidates:
+                content = candidate.get("content")
+                if not isinstance(content, dict):
+                    continue
+                for part in content.get("parts", []):
+                    if (
+                        isinstance(part, dict)
+                        and not part.get("thought")
+                        and isinstance(part.get("text"), str)
+                    ):
+                        texts.append(part["text"])
+            final_content = "\n".join(text for text in texts if text)
+            attempts.append(
+                {
+                    "attempt": semantic_attempt,
+                    "max_output_tokens": max_output_tokens,
+                    "finish_reasons": finish_reasons,
+                    "finish_messages": finish_messages,
+                    "usage_metadata": response.get("usageMetadata"),
+                    "content_length": len(final_content),
+                }
+            )
+            self.last_response_metadata = {
+                "provider": self.config.provider,
+                "model": self.config.model,
+                "attempts": attempts,
+            }
+            hit_token_limit = any(
+                reason.strip().upper() == "MAX_TOKENS" for reason in finish_reasons
+            )
+            retry_tokens = min(max_output_tokens * 2, 8192)
+            if semantic_attempt == 1 and hit_token_limit and retry_tokens > max_output_tokens:
+                max_output_tokens = retry_tokens
                 continue
-            content = candidate.get("content")
-            if not isinstance(content, dict):
-                continue
-            for part in content.get("parts", []):
-                if (
-                    isinstance(part, dict)
-                    and not part.get("thought")
-                    and isinstance(part.get("text"), str)
-                ):
-                    texts.append(part["text"])
-        content = "\n".join(text for text in texts if text)
-        if not content:
-            feedback = response.get("promptFeedback")
+            break
+        if not final_content:
+            feedback = final_response.get("promptFeedback")
             detail = f": {feedback}" if feedback else ""
             raise RuntimeError(f"MR Google API returned empty text content{detail}")
-        return content
+        return final_content
 
     def _post_json(
         self,
@@ -450,6 +602,44 @@ def _google_endpoint(base_url: str, model: str) -> str:
     return f"{base}/models/{encoded_model}:generateContent"
 
 
+def _google_response_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "reason": {"type": "string"},
+            "recovery": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "required": {"type": "boolean"},
+                    "failed_action": {"type": ["string", "null"]},
+                    "failed_node_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["required", "failed_action", "failed_node_ids"],
+            },
+            "action": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "object": {"type": ["string", "null"]},
+                    "target": {"type": ["string", "null"]},
+                    "node_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["name", "object", "target", "node_ids"],
+            },
+        },
+        "required": ["reason", "recovery", "action"],
+    }
+
+
 def _responses_output_text(response: Any) -> str:
     output_text = getattr(response, "output_text", None)
     if isinstance(output_text, str) and output_text:
@@ -460,6 +650,59 @@ def _responses_output_text(response: Any) -> str:
             if isinstance(text, str) and text:
                 return text
     return ""
+
+
+def _responses_attempt_metadata(
+    response: Any,
+    *,
+    attempt: int,
+    requested_max_output_tokens: int,
+    content_length: int,
+) -> dict[str, Any]:
+    outputs = list(getattr(response, "output", None) or [])
+    output_types: list[str] = []
+    content_types: list[str] = []
+    for output in outputs:
+        output_type = getattr(output, "type", None)
+        if output_type is not None:
+            output_types.append(str(output_type))
+        for item in getattr(output, "content", None) or []:
+            content_type = getattr(item, "type", None)
+            if content_type is not None:
+                content_types.append(str(content_type))
+    return {
+        "attempt": attempt,
+        "requested_max_output_tokens": requested_max_output_tokens,
+        "response_id": getattr(response, "id", None),
+        "status": getattr(response, "status", None),
+        "incomplete_details": _response_metadata_value(
+            getattr(response, "incomplete_details", None)
+        ),
+        "error": _response_metadata_value(getattr(response, "error", None)),
+        "usage": _response_metadata_value(getattr(response, "usage", None)),
+        "output_count": len(outputs),
+        "output_types": output_types,
+        "content_types": content_types,
+        "content_length": content_length,
+    }
+
+
+def _response_metadata_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _response_metadata_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_response_metadata_value(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _response_metadata_value(model_dump(mode="json"))
+    if hasattr(value, "__dict__"):
+        return _response_metadata_value(vars(value))
+    return str(value)
 
 
 class BrainHarness:
@@ -476,3 +719,8 @@ class BrainHarness:
 
     def decide_request(self, request: BrainRequest) -> Any:
         return self.adapter.parse_response(self.policy.complete(request))
+
+    @property
+    def last_response_metadata(self) -> dict[str, Any] | None:
+        metadata = getattr(self.policy, "last_response_metadata", None)
+        return metadata if isinstance(metadata, dict) else None

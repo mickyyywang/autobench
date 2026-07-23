@@ -11,5 +11,7 @@ outputs/
 view_graph/*
 task_specs_cn/*
 evaluations/*
+evaluations_old/*
 saved/*
 exp/*
+logs/*

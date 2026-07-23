@@ -252,12 +252,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect.add_argument("--max-episodes", type=int, default=None)
     collect.add_argument("--max-steps", type=int, default=None)
-    collect.add_argument("--teacher-provider", choices=("openai", "qwen", "compatible"), default="qwen")
+    collect.add_argument(
+        "--teacher-provider",
+        choices=("openai", "qwen", "compatible", "mr_openai"),
+        default="qwen",
+    )
     collect.add_argument("--teacher-model", default=None)
     collect.add_argument(
         "--teacher-api-key-env",
         default=None,
-        help="Teacher API key environment variable. Defaults to DASHSCOPE_API_KEY for qwen, OPENAI_API_KEY otherwise.",
+        help=(
+            "Teacher API key environment variable. Defaults to DASHSCOPE_API_KEY for qwen, "
+            "MR_API_KEY for mr_openai, and OPENAI_API_KEY otherwise."
+        ),
     )
     collect.add_argument("--teacher-api-base-url", default=None)
     collect.add_argument(
@@ -288,6 +295,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--placement-edge-constraints",
         default=None,
         help="Optional JSON file that forbids or whitelists placement edges for putin/puton valid actions.",
+    )
+    collect.add_argument(
+        "--condition-file",
+        default=None,
+        help=(
+            "Optional standalone condition JSON. If omitted, --condition-id is "
+            "loaded from each task's metadata.collection_conditions."
+        ),
+    )
+    collect.add_argument(
+        "--condition-id",
+        default=None,
+        help=(
+            "Condition id selected from --condition-file or from each TaskRecord's "
+            "metadata.collection_conditions."
+        ),
     )
 
     eval_real = subparsers.add_parser(
@@ -407,6 +430,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "chat_completions", "responses", "anthropic_messages", "gemini_generate_content"),
         default="auto",
     )
+    eval_graph_rollout.add_argument(
+        "--json-response-format",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request JSON mode from Chat Completions when the model supports it.",
+    )
     eval_graph_rollout.add_argument("--timeout-seconds", type=int, default=120)
     eval_graph_rollout.add_argument("--temperature", type=float, default=0.0)
     eval_graph_rollout.add_argument("--max-output-tokens", type=int, default=2048)
@@ -475,6 +504,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "chat_completions", "responses", "anthropic_messages", "gemini_generate_content"),
         default="auto",
     )
+    eval_graph_manifest.add_argument(
+        "--json-response-format",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request JSON mode from Chat Completions when the model supports it.",
+    )
     eval_graph_manifest.add_argument("--timeout-seconds", type=int, default=120)
     eval_graph_manifest.add_argument("--temperature", type=float, default=0.0)
     eval_graph_manifest.add_argument("--max-output-tokens", type=int, default=2048)
@@ -491,6 +526,90 @@ def build_parser() -> argparse.ArgumentParser:
     eval_graph_manifest.add_argument("--history-window", type=int, default=8)
     eval_graph_manifest.add_argument("--max-consecutive-model-errors", type=int, default=3)
     eval_graph_manifest.add_argument("--fail-fast", action="store_true")
+
+    eval_robotwin_closed_loop = subparsers.add_parser(
+        "evaluate-robotwin-closed-loop",
+        help=(
+            "Run a visual closed-loop policy in RoboTwin while maintaining a "
+            "non-policy metric view graph."
+        ),
+    )
+    eval_robotwin_closed_loop.add_argument("--view-graph", required=True)
+    eval_robotwin_closed_loop.add_argument("--tasks", required=True)
+    eval_robotwin_closed_loop.add_argument(
+        "--output",
+        required=True,
+        help="Output evaluation JSONL base path; a timestamp is appended.",
+    )
+    eval_robotwin_closed_loop.add_argument(
+        "--provider",
+        choices=("openai", "qwen", "compatible", "mr_openai", "mr_anthropic", "mr_google"),
+        default="qwen",
+    )
+    eval_robotwin_closed_loop.add_argument("--model", default=None)
+    eval_robotwin_closed_loop.add_argument("--model-name", default=None)
+    eval_robotwin_closed_loop.add_argument("--api-key-env", default=None)
+    eval_robotwin_closed_loop.add_argument("--api-base-url", default=None)
+    eval_robotwin_closed_loop.add_argument(
+        "--api-style",
+        choices=("auto", "chat_completions", "responses", "anthropic_messages", "gemini_generate_content"),
+        default="auto",
+    )
+    eval_robotwin_closed_loop.add_argument("--timeout-seconds", type=int, default=120)
+    eval_robotwin_closed_loop.add_argument("--temperature", type=float, default=0.0)
+    eval_robotwin_closed_loop.add_argument("--max-output-tokens", type=int, default=2048)
+    eval_robotwin_closed_loop.add_argument("--max-api-attempts", type=int, default=1)
+    eval_robotwin_closed_loop.add_argument("--retry-backoff-seconds", type=float, default=5.0)
+    eval_robotwin_closed_loop.add_argument("--retry-max-seconds", type=float, default=60.0)
+    eval_robotwin_closed_loop.add_argument("--max-steps", type=int, default=100)
+    eval_robotwin_closed_loop.add_argument("--max-episodes", type=int, default=None)
+    eval_robotwin_closed_loop.add_argument("--history-window", type=int, default=8)
+    eval_robotwin_closed_loop.add_argument("--max-consecutive-model-errors", type=int, default=3)
+    eval_robotwin_closed_loop.add_argument(
+        "--max-consecutive-no-graph-updates",
+        type=int,
+        default=12,
+        help="Terminate a stuck rollout after this many consecutive non-committing actions.",
+    )
+    eval_robotwin_closed_loop.add_argument(
+        "--cameras",
+        default="head_camera,left_camera,right_camera,overview_camera",
+        help="Comma-separated RoboTwin RGB cameras passed to the policy.",
+    )
+    eval_robotwin_closed_loop.add_argument(
+        "--require-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    eval_robotwin_closed_loop.add_argument("--soft-optimal-beta", type=float, default=1.0)
+    eval_robotwin_closed_loop.add_argument("--fail-fast", action="store_true")
+    eval_robotwin_closed_loop.add_argument(
+        "--placement-edge-constraints",
+        default=None,
+        help="Optional placement constraints used only by the metric view graph.",
+    )
+    eval_robotwin_closed_loop.add_argument(
+        "--robotwin-root",
+        default="/home/wmq/project/bench/RoboTwin",
+    )
+    eval_robotwin_closed_loop.add_argument(
+        "--robotwin-task-config",
+        default="task_config/demo_clean.yml",
+    )
+    eval_robotwin_closed_loop.add_argument("--robotwin-asset-map", default=None)
+    eval_robotwin_closed_loop.add_argument(
+        "--robotwin-output-dir",
+        required=True,
+        help="Directory for per-step RoboTwin observations and physical artifacts.",
+    )
+    eval_robotwin_closed_loop.add_argument("--robotwin-seed", type=int, default=7)
+    eval_robotwin_closed_loop.add_argument("--robotwin-render", action="store_true")
+    eval_robotwin_closed_loop.add_argument(
+        "--execution-mode",
+        choices=("strict", "assisted"),
+        default="assisted",
+        help="assisted is the default for closed-loop policy development.",
+    )
 
     validate_robotwin = subparsers.add_parser(
         "validate-robotwin-task",
@@ -643,7 +762,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote {len(results)} profiled view graphs to {args.output}")
         return 0
     if args.command == "collect-trajectories":
-        from .harness import FailureInjectionConfig, TeacherPolicyConfig, collect_symbolic_trajectories
+        from .harness import (
+            FailureInjectionConfig,
+            TeacherPolicyConfig,
+            collect_symbolic_trajectories,
+            load_collection_condition,
+        )
 
         teacher_config = None
         if args.mode == "teacher":
@@ -666,6 +790,14 @@ def main(argv: list[str] | None = None) -> int:
             max_failures_per_episode=args.max_failures_per_episode,
             seed=args.failure_seed,
         )
+        collection_condition = (
+            load_collection_condition(args.condition_file, args.condition_id)
+            if args.condition_file
+            else None
+        )
+        embedded_condition_id = args.condition_id if not args.condition_file else None
+        if (collection_condition is not None or embedded_condition_id) and args.backend != "symbolic":
+            raise ValueError("collection conditions currently require --backend symbolic")
         backend_factory = None
         if args.backend == "robotwin":
             from .robotwin_adapter import RoboTwinBackend, RoboTwinBackendConfig
@@ -693,6 +825,8 @@ def main(argv: list[str] | None = None) -> int:
             teacher_config=teacher_config,
             failure_injection=failure_injection,
             placement_edge_constraints_path=args.placement_edge_constraints,
+            collection_condition=collection_condition,
+            collection_condition_id=embedded_condition_id,
             backend_factory=backend_factory,
         )
         print(f"Wrote {result.count} {args.backend} trajectories to {result.output_path}")
@@ -746,6 +880,7 @@ def main(argv: list[str] | None = None) -> int:
             api_key_env=args.api_key_env,
             api_base_url=args.api_base_url,
             api_style=args.api_style,
+            json_response_format=args.json_response_format,
             timeout_seconds=args.timeout_seconds,
             temperature=args.temperature,
             max_output_tokens=args.max_output_tokens,
@@ -786,6 +921,7 @@ def main(argv: list[str] | None = None) -> int:
             api_key_env=args.api_key_env,
             api_base_url=args.api_base_url,
             api_style=args.api_style,
+            json_response_format=args.json_response_format,
             timeout_seconds=args.timeout_seconds,
             temperature=args.temperature,
             max_output_tokens=args.max_output_tokens,
@@ -807,6 +943,54 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"Completed {result['condition_count']} intervention conditions")
         print(f"Wrote intervention suite summary to {result['suite_summary_path']}")
+        return 0
+    if args.command == "evaluate-robotwin-closed-loop":
+        from .robotwin_closed_loop_eval import (
+            RobotTwinClosedLoopEvalConfig,
+            evaluate_robotwin_closed_loop,
+        )
+
+        config = RobotTwinClosedLoopEvalConfig(
+            provider=args.provider,
+            model=args.model,
+            model_name=args.model_name,
+            api_key_env=args.api_key_env,
+            api_base_url=args.api_base_url,
+            api_style=args.api_style,
+            timeout_seconds=args.timeout_seconds,
+            temperature=args.temperature,
+            max_output_tokens=args.max_output_tokens,
+            max_api_attempts=args.max_api_attempts,
+            retry_backoff_seconds=args.retry_backoff_seconds,
+            retry_max_seconds=args.retry_max_seconds,
+            max_steps=args.max_steps,
+            max_episodes=args.max_episodes,
+            history_window=args.history_window,
+            max_consecutive_model_errors=args.max_consecutive_model_errors,
+            max_consecutive_no_graph_updates=args.max_consecutive_no_graph_updates,
+            cameras=_csv(args.cameras),
+            require_images=args.require_images,
+            soft_optimal_beta=args.soft_optimal_beta,
+            fail_fast=args.fail_fast,
+            robotwin_root=Path(args.robotwin_root),
+            robotwin_task_config=Path(args.robotwin_task_config),
+            robotwin_asset_map=(
+                Path(args.robotwin_asset_map) if args.robotwin_asset_map else None
+            ),
+            robotwin_output_dir=Path(args.robotwin_output_dir),
+            robotwin_seed=args.robotwin_seed,
+            robotwin_render=args.robotwin_render,
+            execution_mode=args.execution_mode,
+        )
+        result = evaluate_robotwin_closed_loop(
+            view_graph_path=args.view_graph,
+            tasks_path=args.tasks,
+            output_path=args.output,
+            config=config,
+            placement_edge_constraints_path=args.placement_edge_constraints,
+        )
+        print(f"Wrote {result['count']} RoboTwin closed-loop records to {result['output_path']}")
+        print(f"Wrote evaluation summary to {result['summary_path']}")
         return 0
     if args.command == "validate-robotwin-task":
         from .robotwin_adapter import validate_robotwin_task

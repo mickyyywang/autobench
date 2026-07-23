@@ -20,7 +20,7 @@ under PROJECT_DIR/saved. Files under saved/old or other subdirectories are ignor
 Optional environment variables:
   PYTHON_BIN       Python executable.
   ENV_FILE         Dotenv file (default: /home/wmq/project/.env).
-  EVALUATION_DIR   Output directory (default: PROJECT_DIR/evaluations).
+  EVALUATION_DIR   Output directory (default: PROJECT_DIR/evaluations/open-loop).
   MODEL_FILTER     Comma-separated model IDs to run, for example:
                    MODEL_FILTER='qwen3.6-plus,gpt-5.5'
   MAX_STEPS        Limit evaluated steps; empty means all steps.
@@ -65,7 +65,7 @@ esac
 
 PYTHON_BIN="${PYTHON_BIN:-/home/yufeng/miniconda3/envs/emb/bin/python}"
 ENV_FILE="${ENV_FILE:-/home/wmq/project/.env}"
-EVALUATION_DIR="${EVALUATION_DIR:-${PROJECT_DIR}/evaluations}"
+EVALUATION_DIR="${EVALUATION_DIR:-${PROJECT_DIR}/evaluations/open-loop}"
 MODEL_FILTER="${MODEL_FILTER:-}"
 MAX_STEPS="${MAX_STEPS:-}"
 DRY_RUN="${DRY_RUN:-0}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import json
 from pathlib import Path
 import re
@@ -77,51 +78,101 @@ def load_evaluation_summary(path: str | Path) -> dict[str, Any] | None:
     return payload
 
 
+@lru_cache(maxsize=1024)
+def _evaluation_source_metadata(
+    path_value: str,
+    path_mtime_ns: int,
+    path_size: int,
+    summary_value: str,
+    summary_mtime_ns: int,
+    summary_size: int,
+) -> dict[str, Any] | None:
+    """Parse source metadata once per on-disk file version.
+
+    The stat fields are deliberately part of the cache key. Evaluation files are
+    written while the UI is running, so a path-only cache would become stale.
+    """
+    del path_mtime_ns, path_size, summary_mtime_ns, summary_size
+    path = Path(path_value)
+    summary_path = Path(summary_value)
+    records = load_evaluation_records(path)
+    if not records or not any("mode" in record and "step" in record for record in records):
+        return None
+    summary = load_evaluation_summary(summary_path)
+    model_name = infer_model_name(path, summary=summary, records=records)
+    evaluation_type = str(
+        (summary or {}).get("evaluation_type")
+        or records[0].get("evaluation_type")
+        or "open_loop_real"
+    )
+    episode_ids = sorted({str(record.get("episode_id") or "") for record in records})
+    modes = sorted({str(record.get("mode") or "") for record in records})
+    condition_ids = sorted(
+        {
+            str(record.get("condition_id") or "")
+            for record in records
+            if record.get("condition_id")
+        }
+    )
+    frame_paths = tuple(
+        sorted(
+            {
+                str(Path(frame).resolve())
+                for record in records
+                for frame in list(
+                    (record.get("request_summary") or {}).get("frame_files") or []
+                )
+            }
+        )
+    )
+    return {
+        "path": path,
+        "name": "",
+        "model_name": model_name,
+        "evaluation_type": evaluation_type,
+        "record_count": len(records),
+        "episode_ids": [value for value in episode_ids if value],
+        "modes": [value for value in modes if value],
+        "condition_ids": condition_ids,
+        "summary_path": summary_path,
+        "has_summary": summary is not None,
+        "mtime": path.stat().st_mtime,
+        "frame_paths": frame_paths,
+    }
+
+
 def evaluation_sources(root: str | Path) -> list[dict[str, Any]]:
     directory = Path(root)
     if not directory.exists():
         return []
     sources: list[dict[str, Any]] = []
-    paths = [*directory.glob("*.jsonl"), *(directory / "closed_loop").glob("*.jsonl")]
+    paths = [
+        *directory.glob("*.jsonl"),
+        *(directory / "open-loop").glob("*.jsonl"),
+        *(directory / "closed_loop").glob("*.jsonl"),
+    ]
     for path in sorted(paths):
-        if not path.is_file() or path.stat().st_size == 0:
+        if not path.is_file():
             continue
         try:
-            records = load_evaluation_records(path)
-            if not records or not any("mode" in record and "step" in record for record in records):
+            path_stat = path.stat()
+            if path_stat.st_size == 0:
                 continue
             summary_path = summary_path_for(path)
-            summary = load_evaluation_summary(summary_path)
-            model_name = infer_model_name(path, summary=summary, records=records)
-            evaluation_type = str(
-                (summary or {}).get("evaluation_type")
-                or records[0].get("evaluation_type")
-                or "open_loop_real"
+            summary_stat = summary_path.stat() if summary_path.is_file() else None
+            cached = _evaluation_source_metadata(
+                str(path.resolve()),
+                path_stat.st_mtime_ns,
+                path_stat.st_size,
+                str(summary_path.resolve()),
+                summary_stat.st_mtime_ns if summary_stat else -1,
+                summary_stat.st_size if summary_stat else -1,
             )
-            episode_ids = sorted({str(record.get("episode_id") or "") for record in records})
-            modes = sorted({str(record.get("mode") or "") for record in records})
-            condition_ids = sorted(
-                {
-                    str(record.get("condition_id") or "")
-                    for record in records
-                    if record.get("condition_id")
-                }
-            )
-            sources.append(
-                {
-                    "path": path,
-                    "name": str(path.relative_to(directory)),
-                    "model_name": model_name,
-                    "evaluation_type": evaluation_type,
-                    "record_count": len(records),
-                    "episode_ids": [value for value in episode_ids if value],
-                    "modes": [value for value in modes if value],
-                    "condition_ids": condition_ids,
-                    "summary_path": summary_path,
-                    "has_summary": summary is not None,
-                    "mtime": path.stat().st_mtime,
-                }
-            )
+            if cached is None:
+                continue
+            source = dict(cached)
+            source["name"] = str(path.relative_to(directory))
+            sources.append(source)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
     sources.sort(key=lambda item: (str(item["model_name"]), str(item["name"])))
@@ -145,7 +196,7 @@ def evaluation_catalog(root: str | Path) -> dict[str, Any]:
             {
                 key: value
                 for key, value in source.items()
-                if key not in {"path", "summary_path", "mtime"}
+                if key not in {"path", "summary_path", "mtime", "frame_paths"}
             }
             for source in sources
         ],
@@ -156,9 +207,57 @@ def evaluation_image_paths(root: str | Path) -> set[Path]:
     return {
         Path(frame).resolve()
         for source in evaluation_sources(root)
-        for record in load_evaluation_records(source["path"])
-        for frame in list((record.get("request_summary") or {}).get("frame_files") or [])
+        for frame in source.get("frame_paths", ())
     }
+
+
+_UI_RECORD_FIELDS = {
+    "evaluation_type",
+    "source_file",
+    "model_name",
+    "episode_id",
+    "step",
+    "mode",
+    "condition_id",
+    "intervention_type",
+    "includes_valid_actions",
+    "expected_action",
+    "predicted_action",
+    "expected_recovery",
+    "predicted_recovery",
+    "reason",
+    "parse_error",
+    "model_error",
+    "score",
+    "recovery_score",
+    "event",
+    "goal_satisfied_after_action",
+    "relaxed_completion_cost_before",
+    "relaxed_completion_cost_after",
+    "injection_applied",
+    "disturbances_applied",
+}
+
+
+def _ui_evaluation_record(
+    record: dict[str, Any],
+    *,
+    result_file: str,
+    base_path: str,
+) -> dict[str, Any]:
+    item = {key: record[key] for key in _UI_RECORD_FIELDS if key in record}
+    request_summary = record.get("request_summary") or {}
+    frame_files = list(request_summary.get("frame_files") or [])
+    item["result_file"] = result_file
+    item["frame_observation"] = (
+        record.get("frame_observation")
+        or request_summary.get("frame_observation")
+        or {}
+    )
+    item["image_urls"] = [
+        f"{base_path}/api/image?path={quote(str(path))}" for path in frame_files
+    ]
+    return item
 
 
 def _ratio(numerator: int, denominator: int) -> float | None:
@@ -367,13 +466,14 @@ def evaluation_reply_payload(
             item["evaluation_type"] = str(
                 item.get("evaluation_type") or source_evaluation_type
             )
-            item["result_file"] = source["name"]
-            frame_files = list((item.get("request_summary") or {}).get("frame_files") or [])
-            item["image_urls"] = [
-                f"{base_path}/api/image?path={quote(str(path))}" for path in frame_files
-            ]
-            records.append(item)
             filtered_source_records.append(item)
+            records.append(
+                _ui_evaluation_record(
+                    item,
+                    result_file=source["name"],
+                    base_path=base_path,
+                )
+            )
 
         summary = load_evaluation_summary(source["summary_path"])
         if summary is not None:
@@ -582,6 +682,8 @@ def create_evaluation_reply_app(
     @router.get("/api/image")
     def image(path: str):
         target = Path(path).resolve()
+        if target not in app.state.allowed_images:
+            app.state.allowed_images = evaluation_image_paths(app.state.evaluation_dir)
         if target not in app.state.allowed_images or not target.is_file():
             raise HTTPException(status_code=404, detail="image not found")
         return FileResponse(target)
@@ -684,22 +786,22 @@ dialog{border:0;border-radius:7px;padding:0;box-shadow:0 20px 60px rgba(20,28,45
 <script>
 const BASE_PATH=__BASE_PATH_JSON__;
 const apiPath=path=>`${BASE_PATH}${path}`;
-const state={catalog:null,payload:null,selectedModels:new Set(),modelsInitialized:false};
+const state={catalog:null,payload:null,selectedModels:new Set(),modelsInitialized:false,filtersInitialized:false};
 const $=id=>document.getElementById(id);
 const esc=value=>String(value??"").replace(/[&<>'"]/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[ch]));
 const pct=value=>value==null?"—":`${(Number(value)*100).toFixed(1)}%`;
 const fetchJSON=async(url,options)=>{const response=await fetch(url,options);const data=await response.json();if(!response.ok)throw new Error(data.detail||data.error||response.statusText);return data};
 function fillSelect(select,values,label){const current=select.value;select.innerHTML=`<option value="">全部 ${esc(label)}</option>`+values.map(value=>`<option value="${esc(value)}">${esc(value)}</option>`).join("");if(values.includes(current))select.value=current}
 function updateModelTrigger(){const selected=[...state.selectedModels];const total=state.catalog?.model_names.length||0;$("modelTrigger").textContent=selected.length===total&&total?`全部模型 (${total})`:selected.length===0?"未选择模型":selected.length===1?selected[0]:`已选 ${selected.length} 个模型`}
-function renderModelPicker(selectAll=false){const models=state.catalog.model_names||[];if(selectAll||!state.modelsInitialized){state.selectedModels=new Set(models);state.modelsInitialized=true}else{state.selectedModels=new Set([...state.selectedModels].filter(model=>models.includes(model)))}$("modelOptions").innerHTML=models.map(model=>`<label class="model-option"><input type="checkbox" value="${esc(model)}" ${state.selectedModels.has(model)?"checked":""}><span>${esc(model)}</span></label>`).join("");$("modelOptions").querySelectorAll("input").forEach(input=>input.addEventListener("change",()=>{input.checked?state.selectedModels.add(input.value):state.selectedModels.delete(input.value);updateModelTrigger();loadReplies().catch(showError)}));updateModelTrigger()}
-async function loadCatalog(selectAll=false){state.catalog=await fetchJSON(apiPath("/api/catalog"));renderModelPicker(selectAll);fillSelect($("episodeFilter"),state.catalog.episode_ids,"Episode");fillSelect($("evaluationTypeFilter"),state.catalog.evaluation_types||[],"Evaluation");fillSelect($("modeFilter"),state.catalog.modes,"Mode");fillSelect($("conditionFilter"),state.catalog.condition_ids||[],"Condition");$("sourceCount").textContent=`${state.catalog.source_count} files · ${state.catalog.record_count} records`;await loadReplies()}
+function renderModelPicker(selectAll=false){const models=state.catalog.model_names||[];if(selectAll){state.selectedModels=new Set(models)}else if(!state.modelsInitialized){state.selectedModels=new Set(models.slice(0,1));state.modelsInitialized=true}else{state.selectedModels=new Set([...state.selectedModels].filter(model=>models.includes(model)))}$("modelOptions").innerHTML=models.map(model=>`<label class="model-option"><input type="checkbox" value="${esc(model)}" ${state.selectedModels.has(model)?"checked":""}><span>${esc(model)}</span></label>`).join("");$("modelOptions").querySelectorAll("input").forEach(input=>input.addEventListener("change",()=>{input.checked?state.selectedModels.add(input.value):state.selectedModels.delete(input.value);updateModelTrigger();loadReplies().catch(showError)}));updateModelTrigger()}
+async function loadCatalog(selectAll=false){state.catalog=await fetchJSON(apiPath("/api/catalog"));renderModelPicker(selectAll);fillSelect($("episodeFilter"),state.catalog.episode_ids,"Episode");fillSelect($("evaluationTypeFilter"),state.catalog.evaluation_types||[],"Evaluation");fillSelect($("modeFilter"),state.catalog.modes,"Mode");fillSelect($("conditionFilter"),state.catalog.condition_ids||[],"Condition");if(!state.filtersInitialized){$("episodeFilter").value=state.catalog.episode_ids?.[0]||"";state.filtersInitialized=true}$("sourceCount").textContent=`${state.catalog.source_count} files · ${state.catalog.record_count} records`;await loadReplies()}
 async function loadReplies(){if(state.selectedModels.size===0){state.payload={record_count:0,records:[],summaries:[],metric_groups:[]};$("filterStatus").textContent="0 steps";renderRecords();renderMetrics();return}const params=new URLSearchParams();params.set("model_names",[...state.selectedModels].join(","));[["episode_id",$("episodeFilter").value],["evaluation_type",$("evaluationTypeFilter").value],["mode",$("modeFilter").value],["condition_id",$("conditionFilter").value]].forEach(([key,value])=>{if(value)params.set(key,value)});$("filterStatus").textContent="加载中";state.payload=await fetchJSON(apiPath(`/api/replies?${params}`));const stepCount=new Set((state.payload.records||[]).map(recordGroupKey)).size;$("filterStatus").textContent=`${stepCount} steps · ${state.payload.record_count} results`;renderRecords();renderMetrics()}
 function actionText(action){if(!action)return"—";const nodes=Array.isArray(action.node_ids)?action.node_ids.join(" → "):"";return `${action.name||action.base_name||"unknown"}${nodes?`(${nodes})`:""}`}
 function recoveryHTML(value){if(!value)return'<span class="recovery-pill">未输出</span>';const required=value.required===true;const nodes=Array.isArray(value.failed_node_ids)&&value.failed_node_ids.length?`<span class="tag">${esc(value.failed_node_ids.join(" → "))}</span>`:"";return `<span class="recovery-pill ${required?"yes":"no"}">${required?"需要恢复":"无需恢复"}</span>${value.failed_action?`<span class="tag">${esc(value.failed_action)}</span>`:""}${nodes}`}
 function recordGroupKey(record){return [record.evaluation_type||"open_loop_real",record.source_file||"",record.episode_id||"",record.step??"",record.mode||"",record.condition_id||""].join("\u001f")}
 function groupRecords(records){const groups=new Map();records.forEach(record=>{const key=recordGroupKey(record);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(record)});const modelOrder=new Map([...state.selectedModels].map((model,index)=>[model,index]));return [...groups.values()].map(group=>group.sort((left,right)=>(modelOrder.get(left.model_name)??9999)-(modelOrder.get(right.model_name)??9999)||String(left.result_file||"").localeCompare(String(right.result_file||""))))}
 function renderModelResult(record){if(record.evaluation_type==="closed_loop_visible_graph"){const eventGood=record.event?.status==="success";const goal=record.goal_satisfied_after_action===true;const eventText=record.event?`${record.event.status||"unknown"}${record.event.failure_type?` · ${record.event.failure_type}`:""}`:"—";const disturbances=record.disturbances_applied||[];const disturbanceTag=disturbances.length?`<span class="tag">干扰 ${disturbances.length}</span>`:"";const disturbanceBlock=disturbances.length?`<div class="section-label">External graph disturbance</div><pre class="reason-text">${esc(JSON.stringify(disturbances,null,2))}</pre>`:"";return `<article class="model-result ${record.model_error?"error":""}"><header class="model-result-head"><span class="model-name">${esc(record.model_name)}</span><span class="tag ${eventGood?"good":"bad"}">Event ${eventGood?"成功":"失败"}</span><span class="tag ${goal?"good":""}">Goal ${goal?"满足":"未满足"}</span>${record.injection_applied?'<span class="tag bad">Injected failure</span>':""}${disturbanceTag}<div class="record-file" title="${esc(record.result_file)}">${esc(record.result_file)}</div></header><div class="model-result-body"><section class="reason"><div class="section-label">Reason</div><div class="reason-text">${esc(record.reason||"未输出 reason")}</div>${record.model_error?`<div class="error-text">${esc(record.model_error)}</div>`:""}${record.parse_error?`<div class="error-text">${esc(record.parse_error)}</div>`:""}${disturbanceBlock}</section><section class="decision"><div class="section-label">Closed-loop transition</div><dl class="compare"><dt>Action</dt><dd>${esc(actionText(record.predicted_action))}</dd><dt>Event</dt><dd class="${eventGood?"action-match":"action-miss"}">${esc(eventText)}</dd><dt>Goal cost</dt><dd>${esc(record.relaxed_completion_cost_before??"—")} → ${esc(record.relaxed_completion_cost_after??"—")}</dd></dl><div class="section-label">Failure recovery</div><dl class="compare"><dt>Expected</dt><dd class="recovery-row">${recoveryHTML(record.expected_recovery)}</dd><dt>Predicted</dt><dd class="recovery-row">${recoveryHTML(record.predicted_recovery)}</dd></dl></section></div></article>`}const exact=record.score?.full_exact===true;const groundingExact=record.recovery_score?.grounding_exact;const recoveryExact=groundingExact===true||(groundingExact==null&&record.recovery_score?.full_exact===true);return `<article class="model-result ${record.model_error?"error":""}"><header class="model-result-head"><span class="model-name">${esc(record.model_name)}</span><span class="tag ${exact?"good":"bad"}">Action ${exact?"正确":"错误"}</span><span class="tag ${recoveryExact?"good":"bad"}">Recovery ${recoveryExact?"正确":"错误"}</span><div class="record-file" title="${esc(record.result_file)}">${esc(record.result_file)}</div></header><div class="model-result-body"><section class="reason"><div class="section-label">Reason</div><div class="reason-text">${esc(record.reason||"未输出 reason")}</div>${record.model_error?`<div class="error-text">${esc(record.model_error)}</div>`:""}${record.parse_error?`<div class="error-text">${esc(record.parse_error)}</div>`:""}</section><section class="decision"><div class="section-label">Action</div><dl class="compare"><dt>Expected</dt><dd>${esc(actionText(record.expected_action))}</dd><dt>Predicted</dt><dd class="${exact?"action-match":"action-miss"}">${esc(actionText(record.predicted_action))}</dd></dl><div class="section-label">Failure recovery</div><dl class="compare"><dt>Expected</dt><dd class="recovery-row">${recoveryHTML(record.expected_recovery)}</dd><dt>Predicted</dt><dd class="recovery-row">${recoveryHTML(record.predicted_recovery)}</dd></dl></section></div></article>`}
-function renderRecords(){const root=$("records");const records=state.payload.records||[];if(!records.length){root.innerHTML='<div class="empty">没有符合当前筛选条件的记录</div>';return}const groups=groupRecords(records);root.innerHTML=groups.map(group=>{const shared=group.find(record=>(record.image_urls||[]).length)||group[0];const images=(shared.image_urls||[]).map((url,index)=>`<figure class="frame" data-image="${esc(url)}"><img src="${esc(url)}" alt="Observation ${index+1}" loading="lazy" onerror="this.parentElement.classList.add('broken');this.remove();this.parentElement.textContent='图片不可用'"></figure>`).join("");const closed=shared.evaluation_type==="closed_loop_visible_graph";const graph=closed?`<pre class="reason-text">${esc(JSON.stringify(shared.current_observation||{},null,2))}</pre>`:"";const frame=shared.frame_observation||shared.request_summary?.frame_observation||{};const hasError=group.some(record=>record.model_error);const modelCount=new Set(group.map(record=>record.model_name)).size;const conditionTag=shared.condition_id?`<span class="tag">${esc(shared.condition_id)}</span>`:"";const observation=closed?graph:`<div class="image-grid">${images||'<div class="frame broken">无图片</div>'}</div><div class="frame-meta">source step ${esc(frame.source_step??"—")} · episode ${esc((frame.source_episode_indices||[]).join(",")||"—")} · ${esc(frame.applied_sampling||"—")}</div>`;return `<article class="record ${hasError?"has-error":""}"><header class="record-head"><span class="step">STEP ${esc(shared.step)}</span><span class="tag">${esc(shared.episode_id)}</span><span class="tag">${esc(shared.evaluation_type||"open_loop_real")}</span><span class="tag">${esc(shared.mode)}</span>${conditionTag}<span class="tag">${modelCount} models · ${group.length} results</span></header><div class="record-body"><section class="visuals"><div class="section-label">Shared observation</div>${observation}</section><section class="results-pane"><div class="model-results-scroll" aria-label="模型结果横向对比"><div class="model-results">${group.map(renderModelResult).join("")}</div></div></section></div></article>`}).join("");root.querySelectorAll("[data-image]").forEach(node=>node.addEventListener("click",()=>{$("largeImage").src=node.dataset.image;$("imageDialog").showModal()}))}
+function renderRecords(){const root=$("records");const records=state.payload.records||[];if(!records.length){root.innerHTML='<div class="empty">没有符合当前筛选条件的记录</div>';return}const groups=groupRecords(records);root.innerHTML=groups.map(group=>{const shared=group.find(record=>(record.image_urls||[]).length)||group[0];const images=(shared.image_urls||[]).map((url,index)=>`<figure class="frame" data-image="${esc(url)}"><img src="${esc(url)}" alt="Observation ${index+1}" loading="lazy" onerror="this.parentElement.classList.add('broken');this.remove();this.parentElement.textContent='图片不可用'"></figure>`).join("");const closed=shared.evaluation_type==="closed_loop_visible_graph";const frame=shared.frame_observation||shared.request_summary?.frame_observation||{};const hasError=group.some(record=>record.model_error);const modelCount=new Set(group.map(record=>record.model_name)).size;const conditionTag=shared.condition_id?`<span class="tag">${esc(shared.condition_id)}</span>`:"";const observation=closed?"":`<div class="image-grid">${images||'<div class="frame broken">无图片</div>'}</div><div class="frame-meta">source step ${esc(frame.source_step??"—")} · episode ${esc((frame.source_episode_indices||[]).join(",")||"—")} · ${esc(frame.applied_sampling||"—")}</div>`;return `<article class="record ${hasError?"has-error":""}"><header class="record-head"><span class="step">STEP ${esc(shared.step)}</span><span class="tag">${esc(shared.episode_id)}</span><span class="tag">${esc(shared.evaluation_type||"open_loop_real")}</span><span class="tag">${esc(shared.mode)}</span>${conditionTag}<span class="tag">${modelCount} models · ${group.length} results</span></header><div class="record-body"><section class="visuals"><div class="section-label">Shared observation</div>${observation}</section><section class="results-pane"><div class="model-results-scroll" aria-label="模型结果横向对比"><div class="model-results">${group.map(renderModelResult).join("")}</div></div></section></div></article>`}).join("");root.querySelectorAll("[data-image]").forEach(node=>node.addEventListener("click",()=>{$("largeImage").src=node.dataset.image;$("imageDialog").showModal()}))}
 const openLoopMetrics=["action_admissibility_rate","soft_optimal_action_score","recovery_detection_f1","recovery_grounding_accuracy","exploration_opportunity_recall","normalized_goal_information_gain","premature_stop_rate","completion_stop_recall"];
 const closedLoopMetrics=["task_success_rate","goal_ever_satisfied_rate","final_goal_satisfied_rate","normalized_goal_progress","teacher_normalized_efficiency","action_executability_rate","average_step_count","episodes_with_injected_failure_rate","average_injected_failure_count","episodes_with_disturbance_rate","average_disturbance_count",...openLoopMetrics];
 const metricLabels={task_success_rate:"闭环结果 · 正确 Stop 成功率",goal_ever_satisfied_rate:"闭环结果 · 曾达成目标率",final_goal_satisfied_rate:"闭环结果 · 最终目标满足率",normalized_goal_progress:"闭环结果 · 归一化目标进展",teacher_normalized_efficiency:"闭环结果 · Teacher 归一化效率",action_executability_rate:"闭环诊断 · 动作可执行率",average_step_count:"闭环诊断 · 平均步数",episodes_with_injected_failure_rate:"干预诊断 · Failure episode 覆盖率",average_injected_failure_count:"干预诊断 · 平均注入 Failure 数",episodes_with_disturbance_rate:"干预诊断 · Graph 干扰 episode 覆盖率",average_disturbance_count:"干预诊断 · 平均 Graph 干扰数",action_admissibility_rate:"动作合理性 · 可接受动作率",soft_optimal_action_score:"动作合理性 · Soft 最优动作分",recovery_detection_f1:"失败恢复 · Recovery 检测 F1",recovery_grounding_accuracy:"失败恢复 · 对象 Grounding 准确率",exploration_opportunity_recall:"主动探索 · 机会召回率",normalized_goal_information_gain:"主动探索 · 归一化目标信息增益",premature_stop_rate:"完成判断 · 提前停止率（越低越好）",completion_stop_recall:"完成判断 · 完成停止召回率"};
@@ -709,7 +811,7 @@ function renderMetrics(){const root=$("metrics");const columns=state.payload.met
 function showError(error){const notice=$("notice");notice.textContent=error.message;notice.className="notice error"}
 $("openImport").addEventListener("click",()=>$("importDialog").showModal());document.querySelectorAll("[data-close]").forEach(button=>button.addEventListener("click",()=>$(button.dataset.close).close()));
 $("importFiles").addEventListener("click",async()=>{const jsonl=$("jsonlFile").files[0],summary=$("summaryFile").files[0],error=$("importError");error.style.display="none";if(!jsonl||!summary){error.textContent="请选择 JSONL 和 summary 文件";error.style.display="block";return}const button=$("importFiles");button.disabled=true;try{await fetchJSON(apiPath("/api/import"),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({jsonl_name:jsonl.name,jsonl_content:await jsonl.text(),summary_name:summary.name,summary_content:await summary.text()})});$("importDialog").close();$("jsonlFile").value="";$("summaryFile").value="";await loadCatalog(true)}catch(err){error.textContent=err.message;error.style.display="block"}finally{button.disabled=false}});
-loadCatalog(true).catch(showError);
+loadCatalog(false).catch(showError);
 </script>
 </body>
 </html>"""

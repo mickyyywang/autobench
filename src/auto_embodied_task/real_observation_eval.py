@@ -128,6 +128,7 @@ class ReplayStepContext:
     expected_recovery: dict[str, Any]
     generated_valid_actions: list[dict[str, Any]] = field(default_factory=list)
     valid_actions_added: list[dict[str, Any]] = field(default_factory=list)
+    task_completion_criterion: Any = None
     counterfactual_backend: SymbolicBackend | None = field(
         default=None,
         repr=False,
@@ -197,6 +198,7 @@ class RealObservationAdapter:
         frame_observation: dict[str, Any] | None = None,
         include_valid_actions: bool = True,
     ) -> BrainRequest:
+        history = _history_for_model(history, history_source=history_source)
         if include_valid_actions:
             action_constraints = [
                 "Choose exactly one action from valid_actions.",
@@ -222,6 +224,7 @@ class RealObservationAdapter:
             }
         action_constraints.extend(
             [
+                "Treat success_criterion as the authoritative task goal; task is only a high-level title.",
                 "Treat recover as an internal transition, not as a second physical action.",
                 "The current observation was captured after the previous task action and before the current action.",
                 "Use the current observation to assess the most recent task action in recent_history; do not use that decision's prior recovery value as its outcome.",
@@ -290,6 +293,7 @@ class RealObservationAdapter:
                 "includes_valid_actions": include_valid_actions,
                 "valid_action_count": len(valid_actions) if include_valid_actions else 0,
                 "history_source": history_source,
+                "history_projection": _history_projection(history_source),
                 "history_count": len(history),
                 "frame_observation": frame_observation or {},
             },
@@ -344,13 +348,22 @@ class RealTrajectoryHarness:
                 )
             wrong_graph = _wrong_replay_observation(contexts, context.step_index)
             for mode in self.config.modes:
-                input_history = (
+                source_history = (
                     context.history
                     if self.config.history_source == "teacher"
                     else inference_histories[mode]
                 )
+                input_history = _history_for_model(
+                    source_history,
+                    history_source=self.config.history_source,
+                )
+                request_task = task.clone()
+                if context.task_completion_criterion is not None:
+                    request_task.task_completion_criterion = copy.deepcopy(
+                        context.task_completion_criterion
+                    )
                 request = self.adapter.build_request(
-                    task=task,
+                    task=request_task,
                     step=context.step,
                     history=input_history,
                     valid_actions=context.valid_actions,
@@ -367,6 +380,9 @@ class RealTrajectoryHarness:
                     "model_name": _evaluation_model_name(self.config),
                     "episode_id": episode.get("episode_id"),
                     "step": context.step.get("step", context.step_index + 1),
+                    "task_completion_criterion": copy.deepcopy(
+                        request_task.task_completion_criterion
+                    ),
                     "mode": mode,
                     "expected_action": context.expected_action,
                     "expected_recovery": context.expected_recovery,
@@ -384,6 +400,8 @@ class RealTrajectoryHarness:
                     "predicted_recovery": None,
                     "reason": None,
                     "parse_error": None,
+                    "parse_repair": None,
+                    "response_metadata": None,
                     "model_error": None,
                     "score": None,
                     "recovery_score": None,
@@ -404,6 +422,10 @@ class RealTrajectoryHarness:
                                 "predicted_recovery": predicted_recovery,
                                 "reason": decision.reason,
                                 "parse_error": decision.parse_error,
+                                "parse_repair": decision.parse_repair,
+                                "response_metadata": copy.deepcopy(
+                                    self.brain_harness.last_response_metadata
+                                ),
                                 "score": _score_action(context.expected_action, predicted, decision.parse_error),
                                 "recovery_score": _score_recovery(
                                     context.expected_recovery,
@@ -432,6 +454,10 @@ class RealTrajectoryHarness:
                         if self.config.fail_fast:
                             raise
                         record["model_error"] = str(exc)
+                        if self.brain_harness is not None:
+                            record["response_metadata"] = copy.deepcopy(
+                                self.brain_harness.last_response_metadata
+                            )
                         record["score"] = _score_action(
                             context.expected_action,
                             {},
@@ -543,7 +569,10 @@ def _replay_inputs(
         arms=str(robot.get("arms") or "double"),
         task_type=str(episode.get("task_type") or "manipulation"),
         task=str(episode.get("task") or ""),
-        task_completion_criterion=episode.get("task_completion_criterion"),
+        task_completion_criterion=episode.get(
+            "initial_task_completion_criterion",
+            episode.get("task_completion_criterion"),
+        ),
         ground_truth_plan=[],
         objects={},
         settings=list(episode.get("settings") or []),
@@ -564,6 +593,9 @@ def _build_replay_contexts(
     contexts: list[ReplayStepContext] = []
     steps = [step for step in episode.get("trajectory", []) or [] if isinstance(step, dict)]
     for step_index, step in enumerate(steps):
+        active_criterion = step.get("task_completion_criterion")
+        if active_criterion is not None:
+            task.task_completion_criterion = copy.deepcopy(active_criterion)
         observation = backend.observe()
         expected_action = _expected_action(step)
         expected_recovery = _expected_recovery(history, expected_action)
@@ -585,6 +617,9 @@ def _build_replay_contexts(
                 expected_recovery=expected_recovery,
                 generated_valid_actions=generated_valid_actions,
                 valid_actions_added=valid_actions_added,
+                task_completion_criterion=copy.deepcopy(
+                    task.task_completion_criterion
+                ),
                 counterfactual_backend=copy.deepcopy(backend),
             )
         )
@@ -639,6 +674,31 @@ def _expected_action(step: dict[str, Any]) -> dict[str, Any]:
 
 def _executed_action(step: dict[str, Any]) -> dict[str, Any]:
     return _normalize_action(step.get("action"), manual_name=step.get("manual_name"))
+
+
+def _history_for_model(
+    history: list[dict[str, Any]],
+    *,
+    history_source: str,
+) -> list[dict[str, Any]]:
+    if history_source != "teacher":
+        return history
+    return [
+        item
+        for item in history
+        if not _is_recover_history_item(item)
+    ]
+
+
+def _is_recover_history_item(item: dict[str, Any]) -> bool:
+    action = item.get("action") if isinstance(item, dict) else None
+    if not isinstance(action, dict):
+        return False
+    return str(action.get("base_name") or action.get("name") or "").lower() == "recover"
+
+
+def _history_projection(history_source: str) -> str:
+    return "teacher_without_recover" if history_source == "teacher" else "inference_actions_only"
 
 
 def _expected_recovery(
@@ -1296,7 +1356,7 @@ def _atomic_completion_cost(
         if predicate in {"INSIDE", "IN"}:
             if target_state.node.is_openable and not target_state.open:
                 requirements.add(("open", target_id))
-            if world._container_is_full(target_id, exclude={object_id}):
+            if world._container_would_exceed_capacity(target_id, object_id):
                 cost += 1.0
         return cost + float(len(requirements))
 
@@ -1385,13 +1445,31 @@ def _access_resolution_requirements(
     node_id: str,
 ) -> set[tuple[str, str]]:
     requirements: set[tuple[str, str]] = set()
-    for blocker_id in world._active_blockers(node_id):
-        resolution_action = "move_aside"
-        for edge in world.active_occlusion_edges:
-            if edge[0] == blocker_id and edge[1] == node_id:
-                resolution_action = world._occlusion_edge_resolution_action(edge)
-                break
-        requirements.add((resolution_action, blocker_id))
+    access_nodes = [node_id]
+    seen = {node_id}
+    current = node_id
+    while current in world.states:
+        state = world.states[current]
+        parent_id = state.location_target
+        if (
+            state.location_relation != "INSIDE"
+            or parent_id is None
+            or parent_id not in world.states
+            or parent_id in seen
+        ):
+            break
+        access_nodes.append(parent_id)
+        seen.add(parent_id)
+        current = parent_id
+
+    for access_node_id in access_nodes:
+        for blocker_id in world._active_blockers(access_node_id):
+            resolution_action = "move_aside"
+            for edge in world.active_occlusion_edges:
+                if edge[0] == blocker_id and edge[1] == access_node_id:
+                    resolution_action = world._occlusion_edge_resolution_action(edge)
+                    break
+            requirements.add((resolution_action, blocker_id))
     requirements.update(("open", ancestor_id) for ancestor_id in _closed_ancestor_ids(world, node_id))
     memory_anchor = world.memory_hidden.get(node_id)
     if memory_anchor is not None and not world._memory_target_revealed(memory_anchor):
@@ -1540,24 +1618,9 @@ def _exploration_obligations(
     hidden = {node_id for node_id in relevant if not world.is_visible(node_id)}
     obligations: set[str] = set()
     for node_id in hidden:
-        for blocker_id in world._active_blockers(node_id):
-            resolution = "move_aside"
-            for edge in world.active_occlusion_edges:
-                if edge[0] == blocker_id and edge[1] == node_id:
-                    resolution = world._occlusion_edge_resolution_action(edge)
-                    break
-            if resolution in {"open", "move_aside"}:
+        for resolution, blocker_id in _access_resolution_requirements(world, node_id):
+            if resolution in {"open", "close", "move_aside"}:
                 obligations.add(f"{resolution}:{blocker_id}")
-        for container_id in _closed_ancestor_ids(world, node_id):
-            obligations.add(f"open:{container_id}")
-        memory_anchor = world.memory_hidden.get(node_id)
-        if memory_anchor is not None and not world._memory_target_revealed(memory_anchor):
-            anchor = world.states.get(memory_anchor)
-            if anchor is not None:
-                if anchor.node.is_openable and not anchor.open:
-                    obligations.add(f"open:{memory_anchor}")
-                elif anchor.node.is_movable:
-                    obligations.add(f"move_aside:{memory_anchor}")
     return obligations, hidden
 
 
@@ -1583,7 +1646,7 @@ def _exploration_step_score(
     action_name, node_ids = _canonical_action_key(predicted, backend)
     handled: set[str] = set()
     revealed: set[str] = set()
-    if action_name in {"open", "move_aside"} and node_ids:
+    if action_name in {"open", "close", "move_aside"} and node_ids:
         opportunity_id = f"{action_name}:{node_ids[0]}"
         event, trial, _ = _simulate_action(backend, predicted)
         if event.get("status") == "success":
@@ -1643,6 +1706,7 @@ def _evaluation_summary(
         "record_count": len(records),
         "modes": list(config.modes),
         "history_source": config.history_source,
+        "history_projection": _history_projection(config.history_source),
         "includes_valid_actions": config.include_valid_actions,
         "frame_sampling": config.frame_sampling,
         "observation_window_seconds": config.observation_window_seconds,

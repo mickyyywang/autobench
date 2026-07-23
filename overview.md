@@ -184,7 +184,8 @@ Exogenous world-state disturbance
   ├── state_regression
   ├── completed_subgoal_rollback
   ├── wrong_container_relocation
-  └── add_occlusion
+  ├── add_occlusion
+  └── add_object
 ```
 
 两类失败需要的 reasoning 不同：
@@ -192,9 +193,9 @@ Exogenous world-state disturbance
 - action failure：意图正确，但 action outcome 与预期不一致；需要检测、grounding、retry 或 replan。
 - state disturbance：过去动作可能确实成功，但之后世界又变化；不能把它错误归因于原动作失败，而应重新观察并修复当前状态。
 
-### 2.1 六个独立 conditions
+### 2.1 八个独立 condition 条目
 
-每个 episode 有 6 个 condition；每个 condition 都从同一个 `initial_view_graph` 重新开始并清空模型 history。
+每个 v5 manifest 有 8 个 condition 条目；每个可执行 condition 都从同一个 `initial_view_graph` 重新开始并清空模型 history。旧 episode 当前有 7 个可执行 condition；不满足第二类 `add_object` 数据前置条件的条目保留为 `eligible: false`，runner 会跳过。
 
 | Condition | 触发与改变 | 测量重点 |
 | --- | --- | --- |
@@ -203,7 +204,9 @@ Exogenous world-state disturbance
 | `state_regression` | episode-specific 状态动作成功后，在下一 observation 前恢复该状态，例如 `open -> false` | 是否重新检查访问状态并重做必要动作 |
 | `completed_subgoal_rollback` | 目标 placement 成功后，把物体移回原 surface | 是否发现已完成目标被破坏并恢复 |
 | `wrong_container_relocation` | 目标 placement 成功后，把物体移入错误但合理的容器 | 是否纠正 plausible wrong state |
-| `add_occlusion` | 在中程首次满足条件时加入可解除的新遮挡 | information loss 后的主动探索 |
+| `add_occlusion` | 在中程撤销一个已完成 placement，并在临时位置加入可解除遮挡 | 主动探索与目标修复 |
+| `add_object_inherit_source_goal` | 源对象局部目标满足后，引入其 copy/同类物体，并动态继承相同局部成功标准 | 新物料出现后的目标扩展与继续整理 |
+| `add_object_existing_task_goal_at_capacity` | 容器达到 `max_items` 后，引入已写入 task goal、但初始图中不存在的物体 | 满容器下的重新规划；仅对满足数据前置条件的 episode 可执行 |
 
 ### 2.2 Action failure
 
@@ -242,15 +245,16 @@ move_aside(大碗)
 
 ### 2.6 Dynamic add-occlusion
 
-`add_occlusion` 不在初始图直接制造干扰。它从 step 3 开始，在 direct goal progress 为 10%–80% 的窗口中寻找当前可用候选，并且最多注入一次。
+`add_occlusion` 不在初始图直接制造干扰。它从 step 3 开始，在 direct goal progress 为 10%–80% 的窗口中寻找当前可用候选，并且最多注入一次。condition 名仍为 `add_occlusion`，运行时会物化为 `relocate_and_add_occlusion`：先把目标移出正确位置，再建立遮挡。
 
 候选必须满足：
 
 - source 和 target 当前均可见且未被拿着；
-- target 对应的 goal fact 尚未完成；
-- source/target 空间上合理；
+- target 当前已经满足一个具体的 `ON`/`INSIDE` goal branch，但全局任务尚未完成；
+- source 和 target 位于同一个根 surface，且该 surface 不等于 target 的正确 placement；
 - 新 edge 当前未激活且确实会隐藏 target；
-- 后端副本验证当前存在成功的 `open(source)` 或 `move_aside(source)` 恢复动作。
+- 干预后 goal completion cost 与 planning cost 均上升；
+- 后端副本验证 `open(source)` 或 `move_aside(source)` 能揭示 target，并可继续 `grab` 后恢复记录的原始 placement。
 
 实际解除动作：
 
@@ -270,7 +274,16 @@ disturbances_applied[].runtime_selection
 disturbances_applied[].spec
 ```
 
-不同模型走到不同状态时可以选中不同候选；这是 state-dependent intervention，而不是复用 teacher step 的固定遮挡。
+`spec.previous_location` 和 `runtime_selection.staging_location` 记录正确位置与临时位置。不同模型走到不同状态时可以选中不同候选；这是 state-dependent intervention，而不是复用 teacher step 的固定遮挡。
+
+### 2.7 Dynamic add-object
+
+闭环 manifest 支持两类 `add_object`：
+
+- `on_object_goal_satisfied + inherit_from`：新 copy/同类物体继承源对象投影后的局部 goal；runtime 把替换 subject 后的表达式动态并入 effective criterion。
+- `on_container_max_items_reached + existing_task_goal`：新增物体必须已经出现在原始 `task_completion_criterion` 中、但不在初始 view graph；runtime 不改 criterion。
+
+生成器不会为第二类伪造 goal。若旧 episode 的初始图已经包含 task goal 中的所有对象，则对应条目标记为 `eligible: false` 并写入 `ineligible_reason`。第一类只选择可由独立 copy 完成的纯 `ON`/`INSIDE` 局部 placement goal，避免继承无法复制的 assembly/attachment 前置结构。
 
 ## 3. View Graph execution model
 
@@ -299,6 +312,8 @@ O_t^{VG}=P_{visible}(G_t).
 - 精确 `max_items` 和容器 item count。
 
 容量仅保留当前 `is_full`。任务文本和 success criterion 会命名目标对象，但不泄露其隐藏位置和当前 relation。
+
+三层抽屉使用有方向的动态结构遮挡：第一层打开时遮挡第二、三层，第二层打开时遮挡第三层，第三层不会反向遮挡上层。图中以 `OCCLUDES(source, target, resolution_action=close)` 表示；边仅在 source 为 `OPEN` 时激活。下层抽屉不可见时，其所有 `INSIDE` 后代也不可见；关闭上层后，系统依据其他仍打开的上层抽屉重新计算可见性。`close` 因此也可以成为 exploration opportunity，并在揭示 goal-relevant 下层抽屉或内容时获得 information gain / soft-optimal 收益。
 
 ### 3.2 动作空间
 
@@ -334,21 +349,21 @@ G_t
 
 ## 4. 数据集状态
 
-当前 [`saved/`](../saved) 顶层有 **13 个 aligned episodes**，共 **688 条 trajectory records**；单 episode 为 **44–61** 条，均值 **52.9**。
+当前 [`saved/`](../saved) 顶层有 **16 个 aligned episodes**，共 **840 条 trajectory records**；单 episode 为 **44–61** 条，均值 **52.5**。
 
 | Task family | Episodes | 长程结构 |
 | --- | ---: | --- |
 | 化妆品收纳 B_1/B_4/B_9/B_10 | 4 | 多容器、遮挡、打开、装配和多物体收纳 |
-| 整理办公桌面 B_1/B_4/B_7/B_8/B_11 | 5 | 文具入盒并关闭、书本/废纸归位、容量限制 |
+| 整理办公桌面 B_1/B_4/B_7/B_8/B_11/B_12/B_13/B_14 | 8 | 文具入盒并关闭、书本/废纸归位、容量限制 |
 | 整理餐桌 A_3/A_4/A_5/A_6 | 4 | 嵌套/叠放、托盘、餐具架和菜篮 |
 
 每个 aligned episode 包含 task、结构化 completion criterion、`initial_view_graph`、teacher trajectory、真机 observation alignment 和执行 metadata。
 
-[`exp/intervention_manifests/`](./intervention_manifests) 中有 13 个一一对应的 manifest，当前版本：
+[`exp/intervention_manifests/`](./intervention_manifests) 中已有 13 个旧 episode 的 manifest；B_12～B_14 尚未纳入这批旧 manifest。当前版本：
 
 ```text
-manifest_version = 3
-generation_algorithm = episode_semantic_v3_runtime_occlusion
+manifest_version = 5
+generation_algorithm = episode_semantic_v5_with_add_object
 ```
 
 生成器逐 episode 分析 goal、initial graph、teacher action sequence、合法/错误目标和遮挡候选，不使用 cosmetics/office/table 的固定对象模板。
@@ -368,7 +383,7 @@ generation_algorithm = episode_semantic_v3_runtime_occlusion
 正式规模：
 
 ```text
-13 episodes × 5 models × 6 conditions = 390 independent rollouts
+13 episodes × 5 models × 7 eligible conditions = 455 independent rollouts
 ```
 
 ### 5.2 支持性评测：real-observation open loop
@@ -421,7 +436,7 @@ normalized progress 使用 goal cost：
 progress=clip((C_{goal}^{init}-C_{goal}^{final})/C_{goal}^{init},0,1).
 \]
 
-这一区分对 intervention 很重要：新遮挡和 state regression 可以不破坏 goal fact，但会增加完成任务所需的 planning prerequisites。
+这一区分对 intervention 很重要：state regression 可以只增加 planning prerequisites；v4 的 compound add-occlusion 会同时撤销 placement goal fact，并增加解除遮挡的 planning prerequisite。
 
 ### 6.3 闭环 outcome metrics
 
@@ -650,12 +665,14 @@ http://127.0.0.1:8771/brian_eval/
 
 输出自动附加时间戳，不覆盖旧结果。每个 JSONL 有 `__summary.json`；manifest runner 另有 suite summary。
 
+模型响应诊断保存在每条 record 的 `response_metadata` 中；Gemini 会记录每次请求的 `finishReason`、`finishMessage`、usage 和 token 上限。`parse_repair=trailing_closing_braces` 表示只移除了完整首个 JSON 后多余的右花括号。
+
 最终论文结果锁定：
 
 ```text
 capability_metric_version = 5
 closed_loop_metric_version = 3
-manifest_version = 3
+manifest_version = 5
 soft_optimal_beta = 1.0
 ```
 
@@ -663,9 +680,10 @@ soft_optimal_beta = 1.0
 
 最近实现验证：
 
-- full tests：157 passed；
-- 13/13 manifests teacher replay validation passed；
-- add-occlusion：13/13 state changed，goal cost unchanged，planning cost increased；
+- full tests：166 passed；另有 1 个 inventory check 因 B_12～B_14 尚无 manifest 而失败；
+- 13/13 manifests semantic validation passed；
+- add-object inherit：13/13 trigger、动态 goal 扩展、grab + restore 验证通过；existing-task-goal 类型在旧 episode 中均因不存在“goal 已引用但初始图缺失”的对象而标记为 ineligible；
+- add-occlusion：13/13 completed placement relocated，target hidden，goal/planning cost increased，并通过 reveal + grab + restore 验证；
 - completed rollback 和 wrong relocation：13/13 goal/planning cost increased；
 - state regression：13/13 state changed and planning cost increased。
 

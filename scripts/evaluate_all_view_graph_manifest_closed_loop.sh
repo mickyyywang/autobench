@@ -11,13 +11,15 @@ Usage:
 
 Runs every intervention manifest against every configured model in
 visible_graph_only + no-valid-actions mode. Each manifest condition is an
-independent rollout reset from its aligned episode's initial view graph.
+independent rollout reset from its declared aligned or view-graph/task source.
 
 Optional environment variables:
   PYTHON_BIN, ENV_FILE, MANIFEST_DIR, EVALUATION_DIR,
   MODEL_FILTER (comma separated), MANIFEST_FILTER (comma separated episode ids),
   CONDITIONS, MAX_STEPS, HISTORY_WINDOW, MAX_CONSECUTIVE_MODEL_ERRORS,
-  SOFT_OPTIMAL_BETA, FAIL_FAST, STOP_ON_ERROR, DRY_RUN.
+  SOFT_OPTIMAL_BETA, MAX_OUTPUT_TOKENS, GPT_MAX_OUTPUT_TOKENS,
+  GEMINI_MAX_OUTPUT_TOKENS,
+  FAIL_FAST, STOP_ON_ERROR, DRY_RUN.
 
 Examples:
   DRY_RUN=1 scripts/evaluate_all_view_graph_manifest_closed_loop.sh
@@ -48,9 +50,12 @@ MODEL_FILTER="${MODEL_FILTER:-}"
 MANIFEST_FILTER="${MANIFEST_FILTER:-}"
 CONDITIONS="${CONDITIONS:-all}"
 MAX_STEPS="${MAX_STEPS:-100}"
-HISTORY_WINDOW="${HISTORY_WINDOW:-8}"
+HISTORY_WINDOW="${HISTORY_WINDOW:-16}"
 MAX_CONSECUTIVE_MODEL_ERRORS="${MAX_CONSECUTIVE_MODEL_ERRORS:-3}"
 SOFT_OPTIMAL_BETA="${SOFT_OPTIMAL_BETA:-1.0}"
+MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-2048}"
+GPT_MAX_OUTPUT_TOKENS="${GPT_MAX_OUTPUT_TOKENS:-4096}"
+GEMINI_MAX_OUTPUT_TOKENS="${GEMINI_MAX_OUTPUT_TOKENS:-4096}"
 FAIL_FAST="${FAIL_FAST:-0}"
 STOP_ON_ERROR="${STOP_ON_ERROR:-0}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -82,6 +87,9 @@ fi
 
 MODEL_SPECS=(
   "qwen3.6-plus|qwen|DASHSCOPE_API_KEY"
+  "qwen3.7-plus|qwen|DASHSCOPE_API_KEY"
+  "deepseek-v4-pro|qwen|DASHSCOPE_API_KEY"
+  "glm-5.2|qwen|DASHSCOPE_API_KEY"
   "gpt-5.5|mr_openai|MR_API_KEY"
   "gpt-5.4-2026-03-05|mr_openai|MR_API_KEY"
   "claude-opus-4-7|mr_anthropic|MR_API_KEY"
@@ -156,6 +164,12 @@ for manifest in "${MANIFESTS[@]}"; do
   for model_spec in "${SELECTED_MODEL_SPECS[@]}"; do
     IFS='|' read -r model provider api_key_env <<< "${model_spec}"
     model_name="${model}_no_valid_action"
+    model_max_output_tokens="${MAX_OUTPUT_TOKENS}"
+    if [[ "${model}" == "gpt-5.5" ]]; then
+      model_max_output_tokens="${GPT_MAX_OUTPUT_TOKENS}"
+    elif [[ "${provider}" == "mr_google" ]]; then
+      model_max_output_tokens="${GEMINI_MAX_OUTPUT_TOKENS}"
+    fi
     args=(
       evaluate-view-graph-intervention-manifest
       --manifest "${manifest}"
@@ -167,6 +181,7 @@ for manifest in "${MANIFESTS[@]}"; do
       --api-key-env "${api_key_env}"
       --timeout-seconds 300
       --temperature 0
+      --max-output-tokens "${model_max_output_tokens}"
       --max-api-attempts 8
       --retry-backoff-seconds 10
       --retry-max-seconds 60

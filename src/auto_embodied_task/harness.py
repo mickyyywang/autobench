@@ -102,6 +102,7 @@ class TeacherDecision:
     parsed_response: dict[str, Any] | None = None
     reason: str = ""
     parse_error: str | None = None
+    parse_repair: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -109,6 +110,7 @@ class TeacherDecision:
             "parsed_response": self.parsed_response,
             "reason": self.reason,
             "parse_error": self.parse_error,
+            "parse_repair": self.parse_repair,
         }
 
 
@@ -445,7 +447,8 @@ def _valid_teacher_actions(observation: dict[str, Any], history: list[dict[str, 
             if not node.get("inspected"):
                 open_priority_node_ids.add(node_id)
         if node.get("openable") and node.get("open") and not held_ids:
-            add("close", [node_id])
+            extra = _reveal_action_extra(node) if node.get("container") else {}
+            add("close", [node_id], **extra)
         if node.get("pressable") and node.get("reachable"):
             add("press", [node_id])
         for reveal_action in _reveal_valid_actions(node):
@@ -737,14 +740,29 @@ class ScriptedTeacherPolicy:
 
 def parse_teacher_decision(text: str) -> TeacherDecision:
     raw = text.strip()
+    parse_repair: str | None = None
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return TeacherDecision(
-            action=ParsedAction(name="invalid_teacher_action", raw=raw),
-            raw_response=raw,
-            parse_error=str(exc),
-        )
+        parsed = None
+        if exc.msg == "Extra data":
+            try:
+                candidate, end_index = json.JSONDecoder().raw_decode(raw)
+            except json.JSONDecodeError:
+                candidate = None
+                end_index = 0
+            suffix = raw[end_index:]
+            if end_index > 0 and suffix and all(
+                character == "}" or character.isspace() for character in suffix
+            ):
+                parsed = candidate
+                parse_repair = "trailing_closing_braces"
+        if parsed is None:
+            return TeacherDecision(
+                action=ParsedAction(name="invalid_teacher_action", raw=raw),
+                raw_response=raw,
+                parse_error=str(exc),
+            )
     # Some JSON-mode providers (notably Gemini through ModelRouter) wrap the
     # requested object in a singleton array even though the prompt asks for an
     # object.  This is unambiguous to normalize; larger or non-object arrays
@@ -757,6 +775,7 @@ def parse_teacher_decision(text: str) -> TeacherDecision:
             raw_response=raw,
             parsed_response=None,
             parse_error="teacher response must be a JSON object",
+            parse_repair=parse_repair,
         )
     try:
         action = _parsed_response_to_action(parsed, raw)
@@ -767,12 +786,14 @@ def parse_teacher_decision(text: str) -> TeacherDecision:
             parsed_response=parsed,
             reason=str(parsed.get("reason", "")),
             parse_error=str(exc),
+            parse_repair=parse_repair,
         )
     return TeacherDecision(
         action=action,
         raw_response=raw,
         parsed_response=parsed,
         reason=str(parsed.get("reason", "")),
+        parse_repair=parse_repair,
     )
 
 
@@ -1000,7 +1021,21 @@ class SemanticWorld:
                 continue
             key = (edge.source, edge.target, edge.relation)
             self.active_occlusion_edges.add(key)
-            self.occlusion_edge_resolution_actions[key] = self._default_occlusion_resolution_action(edge.source)
+            explicit_resolution = edge.metadata.get("resolution_action")
+            if explicit_resolution is None:
+                resolution_action = self._default_occlusion_resolution_action(edge.source)
+            else:
+                resolution_action = str(explicit_resolution).strip().lower().replace("-", "_").replace(" ", "_")
+                if resolution_action == "moveaside":
+                    resolution_action = "move_aside"
+                if resolution_action == "shut":
+                    resolution_action = "close"
+                if resolution_action not in {"open", "close", "move_aside"}:
+                    raise ValueError(
+                        f"Unsupported occlusion resolution_action {explicit_resolution!r} "
+                        f"for edge {edge.source!r} -> {edge.target!r}"
+                    )
+            self.occlusion_edge_resolution_actions[key] = resolution_action
 
     def _default_occlusion_resolution_action(self, source_id: str) -> str:
         source = self.states.get(source_id)
@@ -1172,7 +1207,62 @@ class SemanticWorld:
                 continue
             if target.location_relation is None:
                 items.add(target_id)
-        return len(items)
+        return sum(self._capacity_item_units(node_id) for node_id in items)
+
+    def _capacity_item_units(
+        self,
+        node_id: str,
+        visiting: set[str] | None = None,
+    ) -> int:
+        """Return how many parent-container capacity slots a direct item uses.
+
+        Ordinary objects and containers use one slot. An explicitly annotated
+        carrier can instead use the number of items it currently carries; the
+        minimum remains one so an empty carrier still occupies physical space.
+        """
+
+        state = self.states.get(node_id)
+        if state is None:
+            return 1
+        if not state.node.has_property("CAPACITY_COUNTS_CONTENTS"):
+            return 1
+        visiting = set(visiting or ())
+        if node_id in visiting:
+            return 1
+        visiting.add(node_id)
+        payload_ids = self._carrier_payload_ids(node_id)
+        if not payload_ids:
+            return 1
+        return max(
+            1,
+            sum(
+                self._capacity_item_units(payload_id, visiting)
+                for payload_id in payload_ids
+            ),
+        )
+
+    def _container_projected_item_count(
+        self,
+        container_id: str,
+        object_id: str,
+    ) -> int:
+        return self._container_item_count(
+            container_id,
+            exclude={object_id},
+        ) + self._capacity_item_units(object_id)
+
+    def _container_would_exceed_capacity(
+        self,
+        container_id: str,
+        object_id: str,
+    ) -> bool:
+        state = self.states.get(container_id)
+        if state is None or not state.node.is_container or state.node.max_items is None:
+            return False
+        return (
+            self._container_projected_item_count(container_id, object_id)
+            > state.node.max_items
+        )
 
     def _container_is_full(self, container_id: str, exclude: set[str] | None = None) -> bool:
         state = self.states.get(container_id)
@@ -1287,20 +1377,32 @@ class SemanticWorld:
         return {"zones": zones, "objects": objects}
 
     def is_visible(self, node_id: str) -> bool:
+        return self._is_visible(node_id, set())
+
+    def _is_visible(self, node_id: str, visiting: set[str]) -> bool:
         if node_id not in self.states:
             return False
+        if node_id in visiting:
+            return False
+        visiting = visiting | {node_id}
         state = self.states[node_id]
         if state.node.is_room or state.held:
             return True
         if self._is_decomposed_parent(node_id) and not state.assembled:
             return False
         assembled_parent_id = self._assembled_part_parent(node_id)
-        if assembled_parent_id is not None and not self.is_visible(assembled_parent_id):
+        if assembled_parent_id is not None and not self._is_visible(assembled_parent_id, visiting):
             return False
         memory_anchor = self.memory_hidden.get(node_id)
         if memory_anchor is not None and not self._memory_target_revealed(memory_anchor):
             return False
         if self._inside_closed_container(node_id):
+            return False
+        if (
+            state.location_relation == "INSIDE"
+            and state.location_target in self.states
+            and not self._is_visible(state.location_target, visiting)
+        ):
             return False
         return not self._active_blockers(node_id)
 
@@ -1373,6 +1475,8 @@ class SemanticWorld:
         resolution_action = self._occlusion_edge_resolution_action(edge)
         if resolution_action == "open":
             return not (source.node.is_openable and source.open)
+        if resolution_action == "close":
+            return source.node.is_openable and source.open
         if resolution_action == "move_aside":
             return not source.moved_aside
         return False
@@ -1619,6 +1723,8 @@ class SemanticWorld:
             return self._failure(action, "missing_target", "close needs a known target")
         if not target.node.is_openable:
             return self._failure(action, "not_openable", f"{target.node.id} is not openable")
+        if not self.is_visible(target.node.id):
+            return self._failure(action, "not_visible", f"{target.node.id} is not visible")
         if any(state.held for state in self.states.values()):
             return self._failure(action, "hands_occupied", f"{target.node.id} needs both hands free to close")
         target.open = False
@@ -1770,13 +1876,20 @@ class SemanticWorld:
                 return self._failure(action, "not_container", f"{target.node.id} is not a container")
             if target.node.is_openable and not target.open:
                 return self._failure(action, "closed_target", f"{target.node.id} is closed")
-            if self._container_is_full(target.node.id, exclude={obj.node.id}):
+            if self._container_would_exceed_capacity(target.node.id, obj.node.id):
+                item_count = self._container_item_count(
+                    target.node.id,
+                    exclude={obj.node.id},
+                )
+                incoming_item_count = self._capacity_item_units(obj.node.id)
                 return self._failure(
                     action,
                     "container_full",
-                    f"{target.node.id} has reached max_items={target.node.max_items}",
+                    f"{target.node.id} would exceed max_items={target.node.max_items}",
                     max_items=target.node.max_items,
-                    item_count=self._container_item_count(target.node.id, exclude={obj.node.id}),
+                    item_count=item_count,
+                    incoming_item_count=incoming_item_count,
+                    projected_item_count=item_count + incoming_item_count,
                 )
         if relation == "ON" and not target.node.is_surface:
             return self._failure(action, "not_surface", f"{target.node.id} is not a surface")
@@ -2360,6 +2473,623 @@ class TrajectoryEvaluator:
         }
 
 
+def load_collection_condition(
+    path: str | Path,
+    condition_id: str | None = None,
+) -> dict[str, Any]:
+    """Load one condition for ``collect-trajectories``.
+
+    The input may be a task-design JSON containing
+    ``conditional_interventions.conditions``, an object with a top-level
+    ``conditions`` array, or one condition object.
+    """
+
+    source = Path(path)
+    if not source.is_file():
+        raise ValueError(f"collection condition file does not exist: {source}")
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{source}: invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{source}: collection condition file must be a JSON object")
+
+    condition_container = payload.get("conditional_interventions", payload)
+    if not isinstance(condition_container, dict):
+        raise ValueError(f"{source}: conditional_interventions must be a JSON object")
+    raw_conditions = condition_container.get("conditions")
+    if raw_conditions is None and condition_container.get("condition_id"):
+        raw_conditions = [condition_container]
+    if not isinstance(raw_conditions, list) or not raw_conditions:
+        raise ValueError(f"{source}: no collection conditions were found")
+
+    conditions: dict[str, dict[str, Any]] = {}
+    for index, raw_condition in enumerate(raw_conditions, start=1):
+        if not isinstance(raw_condition, dict):
+            raise ValueError(f"{source}: condition {index} must be a JSON object")
+        normalized = _normalize_collection_condition(raw_condition, source=source, index=index)
+        normalized_id = str(normalized["condition_id"])
+        if normalized_id in conditions:
+            raise ValueError(f"{source}: duplicate condition_id {normalized_id!r}")
+        conditions[normalized_id] = normalized
+
+    selected_id = str(condition_id or "").strip()
+    if not selected_id:
+        if len(conditions) != 1:
+            raise ValueError(
+                f"{source}: choose --condition-id from {sorted(conditions)}"
+            )
+        selected_id = next(iter(conditions))
+    if selected_id not in conditions:
+        raise ValueError(
+            f"{source}: unknown condition_id {selected_id!r}; available ids: {sorted(conditions)}"
+        )
+    return copy.deepcopy(conditions[selected_id])
+
+
+def load_task_collection_condition(
+    task: TaskRecord,
+    condition_id: str,
+) -> dict[str, Any]:
+    """Load one collection condition embedded in a TaskRecord's metadata."""
+
+    condition_container = task.metadata.get("collection_conditions")
+    if condition_container is None:
+        condition_container = task.metadata.get("conditional_interventions")
+    source = Path(f"outputs/<task:{task.task_id}>")
+    if not isinstance(condition_container, dict):
+        raise ValueError(
+            f"task {task.task_id!r} has no metadata.collection_conditions"
+        )
+    raw_conditions = condition_container.get("conditions")
+    if not isinstance(raw_conditions, list) or not raw_conditions:
+        raise ValueError(
+            f"task {task.task_id!r} metadata.collection_conditions.conditions "
+            "must be a non-empty array"
+        )
+    selected_id = str(condition_id or "").strip()
+    for index, raw_condition in enumerate(raw_conditions, start=1):
+        if not isinstance(raw_condition, dict):
+            raise ValueError(
+                f"task {task.task_id!r} collection condition {index} must be an object"
+            )
+        normalized = _normalize_collection_condition(
+            raw_condition,
+            source=source,
+            index=index,
+        )
+        if normalized["condition_id"] == selected_id:
+            return normalized
+    available_ids = [
+        str(item.get("condition_id"))
+        for item in raw_conditions
+        if isinstance(item, dict) and item.get("condition_id")
+    ]
+    raise ValueError(
+        f"task {task.task_id!r} has no collection condition {selected_id!r}; "
+        f"available ids: {available_ids}"
+    )
+
+
+def _normalize_collection_condition(
+    condition: dict[str, Any],
+    *,
+    source: Path,
+    index: int,
+) -> dict[str, Any]:
+    normalized = copy.deepcopy(condition)
+    condition_id = str(normalized.get("condition_id") or "").strip()
+    if not condition_id:
+        raise ValueError(f"{source}: condition {index} needs condition_id")
+    trigger = normalized.get("trigger")
+    disturbance = normalized.get("graph_disturbance")
+    if not isinstance(trigger, dict):
+        raise ValueError(f"{source}: condition {condition_id} needs a trigger object")
+    if not isinstance(disturbance, dict):
+        raise ValueError(
+            f"{source}: condition {condition_id} needs a graph_disturbance object"
+        )
+
+    trigger_type = str(trigger.get("type") or "").strip().lower()
+    supported_trigger_types = {
+        "on_container_max_items_reached",
+        "on_any_container_max_items_reached",
+    }
+    if trigger_type not in supported_trigger_types:
+        raise ValueError(
+            f"{source}: collect-trajectories condition {condition_id} only supports "
+            "trigger types on_container_max_items_reached or "
+            "on_any_container_max_items_reached"
+        )
+    trigger["type"] = trigger_type
+    if trigger_type == "on_container_max_items_reached":
+        if not trigger.get("node_id"):
+            raise ValueError(f"{source}: condition {condition_id} trigger needs node_id")
+    else:
+        node_ids = trigger.get("node_ids")
+        if not isinstance(node_ids, list) or not node_ids:
+            raise ValueError(
+                f"{source}: condition {condition_id} trigger needs a non-empty node_ids array"
+            )
+        trigger["node_ids"] = [str(node_id) for node_id in node_ids]
+
+    operation = str(disturbance.get("operation") or "").strip().lower()
+    if operation != "add_object":
+        raise ValueError(
+            f"{source}: collect-trajectories condition {condition_id} only supports "
+            f"operation add_object, got {operation!r}"
+        )
+    object_spec = disturbance.get("object")
+    if not isinstance(object_spec, dict):
+        raise ValueError(
+            f"{source}: condition {condition_id} add_object needs an object definition"
+        )
+    if not object_spec.get("id") or not object_spec.get("name"):
+        raise ValueError(
+            f"{source}: condition {condition_id} add_object object needs id and name"
+        )
+    if object_spec.get("copy_from") is not None:
+        raise ValueError(
+            f"{source}: collect-trajectories condition {condition_id} does not support "
+            "object.copy_from; use the closed-loop intervention runtime"
+        )
+    success_policy = disturbance.get("success_policy") or {
+        "type": "existing_task_goal"
+    }
+    if not isinstance(success_policy, dict):
+        raise ValueError(
+            f"{source}: condition {condition_id} success_policy must be an object"
+        )
+    policy_type = str(success_policy.get("type") or "").strip().lower()
+    supported_policy_types = {"existing_task_goal", "trigger_container_goal"}
+    if policy_type not in supported_policy_types:
+        raise ValueError(
+            f"{source}: collect-trajectories condition {condition_id} only supports "
+            "success_policy.type existing_task_goal or trigger_container_goal"
+        )
+    success_policy["type"] = policy_type
+    if policy_type == "trigger_container_goal":
+        predicate = normalize_relation(str(success_policy.get("predicate") or "INSIDE"))
+        if predicate == "IN":
+            predicate = "INSIDE"
+        if predicate != "INSIDE":
+            raise ValueError(
+                f"{source}: condition {condition_id} trigger_container_goal only supports "
+                "predicate INSIDE"
+            )
+        if trigger_type != "on_any_container_max_items_reached":
+            raise ValueError(
+                f"{source}: condition {condition_id} trigger_container_goal requires "
+                "trigger type on_any_container_max_items_reached"
+            )
+        success_policy["predicate"] = predicate
+    disturbance["success_policy"] = success_policy
+    relation = disturbance.get("relation")
+    if relation is None:
+        raise ValueError(
+            f"{source}: condition {condition_id} add_object needs a spawn relation"
+        )
+    if relation is not None:
+        relation = normalize_relation(str(relation))
+        relation = "INSIDE" if relation == "IN" else relation
+        if relation not in {"ON", "INSIDE", "BENEATH"}:
+            raise ValueError(
+                f"{source}: condition {condition_id} add_object relation must be "
+                "ON, INSIDE/IN, or BENEATH"
+            )
+        if not disturbance.get("target"):
+            raise ValueError(f"{source}: condition {condition_id} disturbance needs target")
+    disturbance["operation"] = operation
+    disturbance["relation"] = relation
+    normalized["condition_id"] = condition_id
+    normalized["intervention_type"] = str(
+        normalized.get("intervention_type") or operation
+    ).strip().lower()
+    normalized["trigger"] = trigger
+    normalized["graph_disturbance"] = disturbance
+    return normalized
+
+
+def _goal_subject_argument_indexes(predicate: str, args: list[Any]) -> tuple[int, ...]:
+    predicate = normalize_relation(predicate)
+    if predicate == "CLOSE":
+        return (1,) if len(args) > 1 else ()
+    if predicate == "PRESSED_SEQUENCE":
+        return ()
+    return (0,) if args else ()
+
+
+def _project_goal_expression(
+    expression: Any,
+    subject_matches: Callable[[Any], bool],
+) -> Any | None:
+    """Keep only goal atoms whose subject matches a selected object."""
+
+    expression = normalize_goal_expression(expression)
+    if isinstance(expression, dict):
+        if "predicate" in expression:
+            predicate = normalize_relation(str(expression["predicate"]))
+            raw_args = expression.get("args", expression.get("arguments", []))
+            args = list(raw_args) if isinstance(raw_args, (list, tuple)) else [raw_args]
+            indexes = _goal_subject_argument_indexes(predicate, args)
+            return (
+                copy.deepcopy(expression)
+                if any(index < len(args) and subject_matches(args[index]) for index in indexes)
+                else None
+            )
+        for operator in ("and", "or"):
+            if operator not in expression:
+                continue
+            raw_children = expression[operator]
+            children = (
+                list(raw_children)
+                if isinstance(raw_children, (list, tuple))
+                else [raw_children]
+            )
+            projected = [
+                child
+                for raw_child in children
+                if (child := _project_goal_expression(raw_child, subject_matches)) is not None
+            ]
+            return {operator: projected} if projected else None
+        if "not" in expression:
+            projected = _project_goal_expression(expression["not"], subject_matches)
+            return {"not": projected} if projected is not None else None
+        if "final" in expression:
+            return _project_goal_expression(expression["final"], subject_matches)
+        return None
+    if isinstance(expression, list):
+        if not expression:
+            return None
+        head = expression[0]
+        normalized_head = normalize_relation(head) if isinstance(head, str) else ""
+        if normalized_head in {"AND", "OR"}:
+            projected = [
+                child
+                for raw_child in expression[1:]
+                if (child := _project_goal_expression(raw_child, subject_matches)) is not None
+            ]
+            return [normalized_head, *projected] if projected else None
+        if normalized_head == "NOT":
+            if len(expression) != 2:
+                return None
+            projected = _project_goal_expression(expression[1], subject_matches)
+            return ["NOT", projected] if projected is not None else None
+        if isinstance(head, str):
+            args = list(expression[1:])
+            indexes = _goal_subject_argument_indexes(normalized_head, args)
+            return (
+                copy.deepcopy(expression)
+                if any(index < len(args) and subject_matches(args[index]) for index in indexes)
+                else None
+            )
+    return None
+
+
+def _replace_goal_subject(
+    expression: Any,
+    subject_matches: Callable[[Any], bool],
+    replacement: str,
+) -> Any:
+    expression = copy.deepcopy(expression)
+    if isinstance(expression, dict):
+        if "predicate" in expression:
+            predicate = normalize_relation(str(expression["predicate"]))
+            args_key = "args" if "args" in expression else "arguments"
+            raw_args = expression.get(args_key, [])
+            args = list(raw_args) if isinstance(raw_args, (list, tuple)) else [raw_args]
+            for index in _goal_subject_argument_indexes(predicate, args):
+                if index < len(args) and subject_matches(args[index]):
+                    args[index] = replacement
+            expression[args_key] = args
+            return expression
+        for key in ("and", "or", "not", "final"):
+            if key not in expression:
+                continue
+            value = expression[key]
+            if key in {"and", "or"} and isinstance(value, (list, tuple)):
+                expression[key] = [
+                    _replace_goal_subject(item, subject_matches, replacement)
+                    for item in value
+                ]
+            else:
+                expression[key] = _replace_goal_subject(value, subject_matches, replacement)
+        return expression
+    if isinstance(expression, list):
+        if not expression:
+            return expression
+        head = expression[0]
+        normalized_head = normalize_relation(head) if isinstance(head, str) else ""
+        if normalized_head in {"AND", "OR", "NOT"}:
+            return [
+                expression[0],
+                *[
+                    _replace_goal_subject(item, subject_matches, replacement)
+                    for item in expression[1:]
+                ],
+            ]
+        args = list(expression[1:])
+        for index in _goal_subject_argument_indexes(normalized_head, args):
+            if index < len(args) and subject_matches(args[index]):
+                args[index] = replacement
+        return [expression[0], *args]
+    return expression
+
+
+def _append_goal_conjunct(expression: Any, addition: Any) -> Any:
+    """Append one runtime goal without rewriting the existing expression."""
+
+    current = copy.deepcopy(expression)
+    added = copy.deepcopy(addition)
+    if current is None or current == "":
+        return added
+    if isinstance(current, dict) and set(current) == {"and"}:
+        raw_children = current["and"]
+        children = list(raw_children) if isinstance(raw_children, (list, tuple)) else [raw_children]
+        if added not in children:
+            children.append(added)
+        return {"and": children}
+    if current == added:
+        return current
+    return {"and": [current, added]}
+
+
+def _node_to_condition_object_spec(node: Node) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": node.id,
+        "name": node.name,
+        "category": node.category,
+        "properties": list(node.properties),
+        "states": list(node.states),
+    }
+    if node.room is not None:
+        payload["room"] = node.room
+    if node.parent is not None:
+        payload["parent"] = node.parent
+    payload.update(copy.deepcopy(node.metadata))
+    return payload
+
+
+class CollectionConditionRuntime:
+    """Add one absent task object when a container reaches max_items."""
+
+    def __init__(self, condition: dict[str, Any] | None) -> None:
+        self.condition = copy.deepcopy(condition) if condition is not None else None
+        self.applied = False
+
+    def validate_initial_state(
+        self,
+        backend: WorldBackend,
+        observation: dict[str, Any],
+    ) -> None:
+        if self.condition is None:
+            return
+        symbolic = self._symbolic_backend(backend)
+        disturbance = self.condition["graph_disturbance"]
+        self._validate_add_object_initial_state(symbolic, disturbance)
+
+    def before_step(
+        self,
+        backend: WorldBackend,
+        *,
+        step_number: int,
+        history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if self.condition is None or self.applied:
+            return []
+        symbolic = self._symbolic_backend(backend)
+        trigger = self.condition["trigger"]
+        trigger_container_id = self._matching_trigger_container(
+            symbolic,
+            trigger=trigger,
+        )
+        if trigger_container_id is None:
+            return []
+
+        disturbance = self.condition["graph_disturbance"]
+        before_observation = symbolic.observe()
+        before_snapshot = symbolic.snapshot()
+        details = self._apply_add_object(
+            symbolic,
+            disturbance,
+            trigger_container_id=trigger_container_id,
+        )
+        after_observation = symbolic.observe()
+        after_snapshot = symbolic.snapshot()
+        before_visible = {
+            str(node.get("id"))
+            for node in before_observation.get("visible_nodes", [])
+            if isinstance(node, dict) and node.get("id") is not None
+        }
+        after_visible = {
+            str(node.get("id"))
+            for node in after_observation.get("visible_nodes", [])
+            if isinstance(node, dict) and node.get("id") is not None
+        }
+        report = {
+            "condition_id": self.condition["condition_id"],
+            "intervention_type": self.condition["intervention_type"],
+            "step": step_number,
+            "phase": "before_observation",
+            "trigger": copy.deepcopy(trigger),
+            "trigger_container_id": trigger_container_id,
+            "trigger_container_name": symbolic.world.states[trigger_container_id].node.name,
+            "operation": "add_object",
+            "spec": copy.deepcopy(disturbance),
+            "details": details,
+            "pre_state_hash": _state_hash(before_snapshot),
+            "post_state_hash": _state_hash(after_snapshot),
+            "state_changed": before_snapshot != after_snapshot,
+            "new_visible_nodes": sorted(after_visible - before_visible),
+            "new_hidden_nodes": sorted(before_visible - after_visible),
+        }
+        self.applied = True
+        return [report]
+
+    @staticmethod
+    def _symbolic_backend(backend: WorldBackend) -> SymbolicBackend:
+        if not isinstance(backend, SymbolicBackend):
+            raise ValueError("collection conditions currently require the symbolic backend")
+        return backend
+
+    def _matching_trigger_container(
+        self,
+        backend: SymbolicBackend,
+        *,
+        trigger: dict[str, Any],
+    ) -> str | None:
+        trigger_type = trigger.get("type")
+        if trigger_type == "on_container_max_items_reached":
+            container_refs = [trigger.get("node_id")]
+        elif trigger_type == "on_any_container_max_items_reached":
+            container_refs = list(trigger.get("node_ids") or [])
+        else:
+            raise ValueError(
+                "collect-trajectories only supports on_container_max_items_reached "
+                "or on_any_container_max_items_reached"
+            )
+        for container_ref in container_refs:
+            container_id = backend.world.resolve_node_id(container_ref)
+            if container_id is None:
+                raise ValueError(
+                    f"collection condition {self.condition['condition_id']} has unknown "
+                    f"trigger container {container_ref!r}"
+                )
+            state = backend.world.states[container_id]
+            if not state.node.is_container:
+                raise ValueError(
+                    f"collection condition trigger node is not a container: {container_id}"
+                )
+            max_items = state.node.max_items
+            if max_items is None:
+                raise ValueError(
+                    f"collection condition trigger container has no max_items: {container_id}"
+                )
+            if backend.world._container_item_count(container_id) >= max_items:
+                return container_id
+        return None
+
+    def _validate_add_object_initial_state(
+        self,
+        backend: SymbolicBackend,
+        disturbance: dict[str, Any],
+    ) -> None:
+        world = backend.world
+        object_spec = disturbance["object"]
+        object_id = str(object_spec["id"])
+        if object_id in world.states:
+            raise ValueError(
+                f"collection condition {self.condition['condition_id']} add_object node "
+                f"{object_id!r} must be absent from the initial view graph"
+            )
+        self._resolve_add_object_target(backend, disturbance)
+        object_name = str(object_spec.get("name") or "")
+        references = {object_id, object_name} - {""}
+        projected = _project_goal_expression(
+            backend.evaluator.task.task_completion_criterion,
+            lambda raw: str(raw) in references,
+        )
+        policy_type = disturbance["success_policy"]["type"]
+        if policy_type == "existing_task_goal" and projected is None:
+            raise ValueError(
+                f"collection condition {self.condition['condition_id']} requires the "
+                f"initial success criterion to reference add_object node "
+                f"{object_id!r}/{object_name!r}"
+            )
+        if policy_type == "trigger_container_goal" and projected is not None:
+            raise ValueError(
+                f"collection condition {self.condition['condition_id']} requires the "
+                f"initial success criterion not to reference add_object node "
+                f"{object_id!r}/{object_name!r}; its goal is added at runtime"
+            )
+
+    def _resolve_add_object_target(
+        self,
+        backend: SymbolicBackend,
+        disturbance: dict[str, Any],
+    ) -> str:
+        relation = disturbance["relation"]
+        target_ref = disturbance.get("target")
+        target_id = backend.world.resolve_node_id(target_ref)
+        if target_id is None:
+            raise ValueError(
+                f"collection condition {self.condition['condition_id']} has unknown "
+                f"add_object target {target_ref!r}"
+            )
+        target = backend.world.states[target_id]
+        if relation == "ON" and not target.node.is_surface:
+            raise ValueError(f"collection condition ON target is not a surface: {target_id}")
+        if relation == "INSIDE" and not target.node.is_container:
+            raise ValueError(
+                f"collection condition INSIDE target is not a container: {target_id}"
+            )
+        return target_id
+
+    def _apply_add_object(
+        self,
+        backend: SymbolicBackend,
+        disturbance: dict[str, Any],
+        *,
+        trigger_container_id: str,
+    ) -> dict[str, Any]:
+        world = backend.world
+        object_spec = copy.deepcopy(disturbance["object"])
+        node = Node.from_dict(object_spec)
+        if node.id in world.states:
+            raise ValueError(f"add_object node id already exists: {node.id!r}")
+        target_id = self._resolve_add_object_target(backend, disturbance)
+
+        state = NodeState(
+            node=node,
+            location_relation=disturbance["relation"],
+            location_target=target_id,
+            open="OPEN" in node.states,
+            pressed="PRESSED" in node.states,
+        )
+        world.states[node.id] = state
+        world._name_to_id.setdefault(node.id, node.id)
+        world._name_to_id.setdefault(node.name, node.id)
+        world._name_to_id.setdefault(node.name.lower(), node.id)
+        success_policy = disturbance["success_policy"]
+        policy_type = success_policy["type"]
+        goal_update: dict[str, Any] = {"type": policy_type, "changed": False}
+        if policy_type == "trigger_container_goal":
+            trigger_container = world.states[trigger_container_id].node
+            added_expression = [
+                success_policy.get("predicate", "INSIDE"),
+                node.name,
+                trigger_container.name,
+            ]
+            previous_criterion = copy.deepcopy(
+                backend.evaluator.task.task_completion_criterion
+            )
+            effective_criterion = _append_goal_conjunct(
+                previous_criterion,
+                added_expression,
+            )
+            backend.evaluator.task.task_completion_criterion = effective_criterion
+            goal_update.update(
+                {
+                    "changed": effective_criterion != previous_criterion,
+                    "trigger_container_id": trigger_container_id,
+                    "trigger_container_name": trigger_container.name,
+                    "added_expression": added_expression,
+                    "previous_criterion": previous_criterion,
+                    "effective_criterion": copy.deepcopy(effective_criterion),
+                }
+            )
+        return {
+            "node_id": node.id,
+            "node": _node_to_condition_object_spec(node),
+            "new_location": {
+                "relation": state.location_relation,
+                "target": state.location_target,
+                "held": state.held,
+            },
+            "goal_update": goal_update,
+        }
+
+
 class SymbolicHarness:
     def __init__(
         self,
@@ -2370,6 +3100,7 @@ class SymbolicHarness:
         teacher_policy: TeacherPolicyProtocol | None = None,
         failure_injection: FailureInjectionConfig | None = None,
         placement_edge_constraints: PlacementEdgeConstraints | None = None,
+        collection_condition: dict[str, Any] | None = None,
         backend: WorldBackend | None = None,
     ) -> None:
         if mode not in {"replay", "teacher"}:
@@ -2382,6 +3113,9 @@ class SymbolicHarness:
         self.max_steps = max_steps
         self.placement_edge_constraints = placement_edge_constraints or PlacementEdgeConstraints()
         self.backend: WorldBackend = backend or SymbolicBackend(graph, task, self.placement_edge_constraints)
+        if collection_condition is not None and not isinstance(self.backend, SymbolicBackend):
+            raise ValueError("collection conditions currently require the symbolic backend")
+        self.condition_runtime = CollectionConditionRuntime(collection_condition)
         self.teacher_policy = teacher_policy
         self.failure_injection = failure_injection or FailureInjectionConfig()
         self.failure_rng = random.Random(self.failure_injection.seed)
@@ -2396,14 +3130,30 @@ class SymbolicHarness:
 
     def _run(self) -> dict[str, Any]:
         backend = self.backend
+        initial_task_completion_criterion = copy.deepcopy(
+            self.task.task_completion_criterion
+        )
         initial_observation = backend.observe()
         initial_snapshot = backend.snapshot()
+        self.condition_runtime.validate_initial_state(backend, initial_observation)
         trajectory = []
         max_steps = self._max_steps()
         history: list[dict[str, Any]] = []
+        condition_events: list[dict[str, Any]] = []
 
         for step_index in range(1, max_steps + 1):
+            before_condition_observation = backend.observe()
+            applied_conditions = self.condition_runtime.before_step(
+                backend,
+                step_number=step_index,
+                history=history,
+            )
             observation = backend.observe()
+            condition_new_visible_nodes = _new_visible_nodes(
+                before_condition_observation,
+                observation,
+            )
+            condition_events.extend(copy.deepcopy(applied_conditions))
             pre_snapshot = backend.snapshot()
             decision = self._next_action(observation, history, step_index)
             requested_action = decision.action
@@ -2415,6 +3165,9 @@ class SymbolicHarness:
             record = {
                 "step": step_index,
                 "mode": self.mode,
+                "task_completion_criterion": copy.deepcopy(
+                    self.task.task_completion_criterion
+                ),
                 "observation": observation,
                 "post_observation": post_observation,
                 "new_visible_nodes": new_visible_nodes,
@@ -2424,6 +3177,9 @@ class SymbolicHarness:
                 "post_state_hash": _state_hash(post_snapshot),
                 "success_after_step": backend.success(),
             }
+            if applied_conditions:
+                record["conditions_applied"] = copy.deepcopy(applied_conditions)
+                record["condition_new_visible_nodes"] = condition_new_visible_nodes
             if injection_record is not None:
                 record["requested_action"] = requested_action.to_json()
                 record["failure_injection"] = injection_record
@@ -2439,6 +3195,8 @@ class SymbolicHarness:
                     "requested_action": requested_action.to_json(),
                     "event": event,
                     "new_visible_nodes": new_visible_nodes,
+                    "conditions_applied": copy.deepcopy(applied_conditions),
+                    "condition_new_visible_nodes": condition_new_visible_nodes,
                     "success_after_step": record["success_after_step"],
                 }
             )
@@ -2456,8 +3214,12 @@ class SymbolicHarness:
             "task_type": self.task.task_type,
             "settings": list(self.task.settings),
             "task": self.task.task,
+            "initial_task_completion_criterion": initial_task_completion_criterion,
             "task_completion_criterion": self.task.task_completion_criterion,
             "failure_injection": self.failure_injection.to_json(),
+            "collection_condition": self.condition_runtime.condition,
+            "condition_applied": bool(condition_events),
+            "condition_events": condition_events,
             "placement_edge_constraints": self.placement_edge_constraints.to_json(),
             "initial_view_graph": _view_graph_to_json(self.graph),
             "initial_observation": initial_observation,
@@ -2549,6 +3311,8 @@ def collect_symbolic_trajectories(
     failure_injection: FailureInjectionConfig | None = None,
     placement_edge_constraints_path: str | Path | None = None,
     placement_edge_constraints: PlacementEdgeConstraints | None = None,
+    collection_condition: dict[str, Any] | None = None,
+    collection_condition_id: str | None = None,
     backend_factory: Callable[[ViewGraph, TaskRecord, PlacementEdgeConstraints], WorldBackend] | None = None,
 ) -> TrajectoryCollectionResult:
     graphs = {graph.scene_id: graph for graph in load_view_graphs_jsonl(view_graph_path)}
@@ -2582,6 +3346,12 @@ def collect_symbolic_trajectories(
                 if backend_factory is not None
                 else None
             )
+            episode_collection_condition = collection_condition
+            if collection_condition_id is not None:
+                episode_collection_condition = load_task_collection_condition(
+                    task,
+                    collection_condition_id,
+                )
             episode = SymbolicHarness(
                 graph,
                 task,
@@ -2590,6 +3360,7 @@ def collect_symbolic_trajectories(
                 teacher_policy=teacher_policy,
                 failure_injection=episode_failure_injection,
                 placement_edge_constraints=placement_edge_constraints,
+                collection_condition=episode_collection_condition,
                 backend=backend,
             ).run()
             handle.write(json.dumps(episode, ensure_ascii=False) + "\n")

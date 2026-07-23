@@ -7,7 +7,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/yufeng/miniconda3/envs/emb/bin/python}"
 
 DEFAULT_INPUT="${PROJECT_DIR}/saved/整理办公桌面B_1_teacher_trajectories_20260712_231519__galaxea_r1lite_20260713_165639_192.168.31.142__aligned_20260714_134802.jsonl"
 INPUT="${1:-${INPUT:-${DEFAULT_INPUT}}}"
-EVALUATION_DIR="${2:-${EVALUATION_DIR:-${PROJECT_DIR}/evaluations}}"
+EVALUATION_DIR="${2:-${EVALUATION_DIR:-${PROJECT_DIR}/evaluations/open-loop}}"
 WITH_VALID_OUTPUT="${WITH_VALID_OUTPUT:-${EVALUATION_DIR}/real_eval_qwen3_6_plus.jsonl}"
 WITHOUT_VALID_OUTPUT="${WITHOUT_VALID_OUTPUT:-${EVALUATION_DIR}/real_eval_qwen3_6_plus_no_valid_actions.jsonl}"
 

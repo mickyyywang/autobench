@@ -191,6 +191,7 @@ class _ProfileEditor:
 
         self._normalize_occlusion_edges()
         achieved = self._achieved_profile()
+        self._add_layered_drawer_occlusions()
         metadata = self.graph.setdefault("metadata", {})
         metadata["requested_constraint_profile"] = copy.deepcopy(self.profile)
         metadata["achieved_constraint_profile"] = achieved
@@ -211,6 +212,58 @@ class _ProfileEditor:
             constraints=copy.deepcopy(self.constraints),
             graph_edits=copy.deepcopy(self.edits),
         )
+
+    def _add_layered_drawer_occlusions(self) -> None:
+        """Add directional open-state occlusion for three vertically stacked drawers.
+
+        These structural edges are added after ordinary profile occlusion is
+        normalised so they do not consume the profile's single-occluder budget
+        and do not remove the drawers' normal placement edges.
+        """
+
+        layer_markers = ("第一层", "第二层", "第三层")
+        for parent_id in sorted(self._node_ids()):
+            part_ids = self._direct_part_ids(parent_id)
+            ordered: list[str] = []
+            for marker in layer_markers:
+                matches = [
+                    part_id
+                    for part_id in part_ids
+                    if marker in str(self._node(part_id).get("name", part_id))
+                    and self._is_container(self._node(part_id))
+                    and self._is_openable(self._node(part_id))
+                ]
+                if len(matches) != 1:
+                    ordered = []
+                    break
+                ordered.append(matches[0])
+            if len(ordered) != 3:
+                continue
+
+            for upper_index, source_id in enumerate(ordered[:-1]):
+                for target_id in ordered[upper_index + 1 :]:
+                    existing = next(
+                        (
+                            edge
+                            for edge in self.edges
+                            if isinstance(edge, dict)
+                            and str(edge.get("from", edge.get("source"))) == source_id
+                            and str(edge.get("to", edge.get("target"))) == target_id
+                            and self._relation(edge) == "OCCLUDES"
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        existing["resolution_action"] = "close"
+                        continue
+                    edge = {
+                        "from": source_id,
+                        "to": target_id,
+                        "relation": "OCCLUDES",
+                        "resolution_action": "close",
+                    }
+                    self.edges.append(edge)
+                    self.edits.append({"type": "add_layered_drawer_occlusion", **copy.deepcopy(edge)})
 
     def _apply_sample_identity(self) -> None:
         if self.num_samples <= 1:
@@ -1026,7 +1079,11 @@ class _ProfileEditor:
                 continue
             source = str(edge.get("from", edge.get("source")))
             target = str(edge.get("to", edge.get("target")))
-            if source == container_id and self._occlusion_resolution_action(self._node(source)) != "open":
+            resolution_action = edge.get("resolution_action")
+            if resolution_action is None and source in self._node_ids():
+                resolution_action = self._occlusion_resolution_action(self._node(source))
+            resolution_action = str(resolution_action or "").strip().lower().replace("-", "_")
+            if source == container_id and resolution_action != "open":
                 continue
             if source == container_id and target != container_id and target not in exclude:
                 items.add(target)

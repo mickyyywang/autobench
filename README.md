@@ -79,6 +79,118 @@ PYTHONPATH=auto_embodied_task/src python -m auto_embodied_task collect-trajector
 
 Set `DASHSCOPE_API_KEY` in the shell or debugger environment. Do not hard-code API keys in docs or committed config.
 
+To run one dynamic condition during collection, embed conditions under
+`metadata.collection_conditions` in the executable `outputs/*_tasks.jsonl`
+TaskRecord and select exactly one condition. The condition is checked before
+every teacher observation and is applied at most once per episode. For the
+toy-organizing task, the red-box condition is:
+
+```bash
+PYTHONPATH=src python -m auto_embodied_task collect-trajectories \
+  --view-graph view_graph/整理玩具A.jsonl \
+  --tasks outputs/整理玩具A_tasks.jsonl \
+  --output outputs/整理玩具A_red_condition_teacher_trajectories.jsonl \
+  --mode teacher \
+  --teacher-provider mr_openai \
+  --teacher-model gpt-5.5 \
+  --teacher-api-key-env MR_API_KEY \
+  --teacher-api-style responses \
+  --teacher-temperature 0 \
+  --max-steps 100 \
+  --condition-id red_box_max_items_add_red_fishing_toy
+```
+
+`整理玩具A_tasks.jsonl` contains only this red-box condition. The separately
+defined `整理玩具B_tasks.jsonl` contains only
+`purple_box_max_items_add_green_plush`: its initial view graph must omit
+`绿色毛绒玩具`, and the purple box reaching `max_items` adds that object. Each
+`add_object` node must be absent from its task's initial view graph. Collection
+validates this requirement before the first teacher call. The collection runtime intentionally supports only
+`on_container_max_items_reached -> add_object` with
+`success_policy.type=existing_task_goal`; it does not support relocation,
+copying, or dynamic goal inheritance. Collection conditions currently require
+the symbolic backend.
+
+`--condition-file` remains available for standalone condition suites. When it
+is omitted, `--condition-id` is resolved from each task record's
+`metadata.collection_conditions`.
+
+Closed-loop evaluation intervention manifests support two broader `add_object`
+patterns. A new copy or same-class object can inherit the source object's local
+goal, including its OR branches:
+
+Natural add-object names are declared separately from existing materials and
+properties in `task_specs_cn/copy_objects.json`:
+
+```json
+{
+  "schema_version": 1,
+  "inherit_copy_disabled_task_groups": ["整理玩具A", "整理玩具B"],
+  "task_groups": {
+    "整理办公桌面B": {
+      "蓝色笔": {
+        "id": "铅笔",
+        "name": "铅笔"
+      }
+    }
+  }
+}
+```
+
+The view-graph creator does not read this registry, so `铅笔` remains absent
+from the initial graph and existing material/property files remain unchanged.
+The registry must cover every material marked `COPYABLE` in each enabled task
+group. A task group listed in `inherit_copy_disabled_task_groups` must not have a
+`task_groups` entry: the generator skips copy-template coverage for it and omits
+the `add_object_inherit_source_goal` disturbance by setting that condition to
+`eligible=false` and `graph_disturbance=null`. In particular, only
+`add_object_existing_task_goal_at_capacity` is eligible as an add-object
+condition for `整理玩具A/B`; each task's late object is already named in the
+task success goal but is absent from its initial view graph.
+The closed-loop manifest generator considers only `COPYABLE` placement sources,
+reads the new object's natural id/name from this registry, and adds `copy_from`
+automatically. At runtime, `category`, `properties`, `states`, `max_items`, and
+all other attributes come from the actual source node in the profiled view graph;
+registry values cannot override them. Thus a magazine copied from an openable
+book stays openable, and a registered identity cannot add behavior absent from
+its source node. The generator does not synthesize
+`<source>__added_copy` names. Repeated source ids such as
+`胡萝卜_1` and `胡萝卜_2` resolve through the base `胡萝卜` template. Templates do
+not alter the initial task criterion. `inherit_from` dynamically adds the source
+object's projected goal only after the new object appears. If that goal includes
+`ASSEMBLED`, the generator also resolves every direct `PART_OF` node through the
+same registry, spawns the new parent and its copied parts on the staging surface,
+and inherits both the assembly and placement requirements.
+
+```json
+{
+  "trigger": {
+    "type": "on_object_goal_satisfied",
+    "node_id": "蓝色笔",
+    "required_predicates": [
+      {"predicate": "CLOSED", "args": ["铅笔盒"]}
+    ]
+  },
+  "graph_disturbance": {
+    "operation": "add_object",
+    "object": {"id": "铅笔", "name": "铅笔", "copy_from": "蓝色笔"},
+    "relation": "ON",
+    "target": "桌面",
+    "success_policy": {"type": "inherit_from", "source_node_id": "蓝色笔"}
+  }
+}
+```
+
+If a task object is already named in the initial task completion criterion but
+is absent from the initial view graph, use
+`on_container_max_items_reached` with
+`"success_policy": {"type": "existing_task_goal"}`. When the object is
+added, the task criterion is unchanged. In the inheritance pattern, the
+source object's projected criterion is dynamically conjoined to the effective
+criterion with the new object substituted for the source. The closed-loop
+intervention report records the previous criterion, added expression, and
+effective criterion under `details.goal_update`.
+
 ### 5. Trajectory Replay UI
 
 Run the replay visualizer from the bench root:
@@ -273,7 +385,7 @@ PYTHONPATH=src python -m auto_embodied_task edit-view-graph \
   --seed 7
 ```
 
-When `--num-samples` is greater than one, each randomized sample gets a unique `scene_id` / `env_id` suffix so manual tasks and trajectory collection can keep the variants separate. Omit `--seed` to get a different random batch each run; pass `--seed` for reproducible experiments. In the spatial profile, `num_occluded_objects` counts distinct occluded target nodes, while `occlusion_depth` controls the required occlusion-chain depth for each selected target. `num_decomposed_parents` counts how many existing parent objects should be decomposed into their `PART_OF` child nodes; only parents that already have `DECOMPOSABLE` and existing part nodes can be selected. Decomposition removes the selected parent node's non-`PART_OF` external relations and recreates them on its direct part nodes, so the view graph directly shows parts participating in the world while the parent remains as a structural owner. Every spatial occlusion layer is represented as a canonical `OCCLUDES` edge, including container blockers; profile editing never writes spatial occlusion as `INSIDE`. Before adding an occluder for a target, profile editing removes existing incoming occlusion edges for that target, so one object has at most one direct occluder. It also removes the occluded target's visible placement edges (`ON`, `INSIDE`, `BENEATH`, and related variants) and visible relative-position edges (`LEFT_OF`, `RIGHT_OF`, `FRONT_OF`, `BEHIND`, `CLOSE`, `NEAR`) while preserving structural `PART_OF` and occlusion-chain edges. Profile editing does not add `OCCLUDER` or `DECOMPOSABLE` to ordinary objects. Each output graph stores `requested_constraint_profile`, `achieved_constraint_profile`, `difficulty_tags`, `profile_constraints`, and `graph_edits` in `metadata`. Difficulty tags are spatial-only, for example `spatial.num_occluded_objects=2`, `spatial.occlusion_depth=2`, and `spatial.num_decomposed_parents=1`; temporal, memory, and failure-recovery difficulty should be represented in the task/harness stage rather than as view-graph edits.
+When `--num-samples` is greater than one, each randomized sample gets a unique `scene_id` / `env_id` suffix so manual tasks and trajectory collection can keep the variants separate. Omit `--seed` to get a different random batch each run; pass `--seed` for reproducible experiments. In the spatial profile, `num_occluded_objects` counts distinct occluded target nodes, while `occlusion_depth` controls the required occlusion-chain depth for each selected target. `num_decomposed_parents` counts how many existing parent objects should be decomposed into their `PART_OF` child nodes; only parents that already have `DECOMPOSABLE` and existing part nodes can be selected. Decomposition removes the selected parent node's non-`PART_OF` external relations and recreates them on its direct part nodes, so the view graph directly shows parts participating in the world while the parent remains as a structural owner. Every spatial occlusion layer is represented as a canonical `OCCLUDES` edge, including container blockers; profile editing never writes spatial occlusion as `INSIDE`. Before adding an ordinary profile occluder for a target, profile editing removes existing incoming profile occlusion edges for that target, so one object has at most one direct profile occluder. It also removes the occluded target's visible placement edges (`ON`, `INSIDE`, `BENEATH`, and related variants) and visible relative-position edges (`LEFT_OF`, `RIGHT_OF`, `FRONT_OF`, `BEHIND`, `CLOSE`, `NEAR`) while preserving structural `PART_OF` and occlusion-chain edges. Three-layer openable storage units additionally receive structural directional edges: first layer to second/third and second layer to third, each with `resolution_action: close`. These edges activate only while the upper layer is open, may give a lower drawer multiple structural blockers, preserve the drawer's placement edge, and propagate invisibility through the lower drawer's `INSIDE` descendants. Profile editing does not add `OCCLUDER` or `DECOMPOSABLE` to ordinary objects. Each output graph stores `requested_constraint_profile`, `achieved_constraint_profile`, `difficulty_tags`, `profile_constraints`, and `graph_edits` in `metadata`. Difficulty tags are spatial-only, for example `spatial.num_occluded_objects=2`, `spatial.occlusion_depth=2`, and `spatial.num_decomposed_parents=1`; temporal, memory, and failure-recovery difficulty should be represented in the task/harness stage rather than as view-graph edits.
 
 ## View Graph JSONL
 
@@ -507,6 +619,8 @@ cd /home/wmq/project/bench/auto_embodied_task
   - completed_subgoal_rollback
   - wrong_container_relocation
   - add_occlusion
+  - add_object_inherit_source_goal（整理玩具A/B保留条目，但为 eligible=false）
+  - add_object_existing_task_goal_at_capacity（仅满足数据前置条件时 eligible）
   - 每种动作类型一次的 failure injection
 
   不再包含针对 cosmetics/office/tabletop 的固定物体模板。错误容器也会排除该物体的所有合法目标，并优先选择轨迹中实际使用过、干扰发生时可见的容器。
@@ -518,11 +632,14 @@ cd /home/wmq/project/bench/auto_embodied_task
   - 被移动物体仍然可见
   - 恢复动作可以成功
   - 新增遮挡能够被解除
+  - 新增 copy 在 staging 位置尚未成功，按继承目标归位后成功
 
-  manifest v3 的 add_occlusion 不再固定发生在 step 1。运行时从第 3 个模型 step
-  起，在任务进度 10%～80% 的窗口内持续检查候选；只有遮挡源和未完成目标当前
-  都可见、空间关系合理，并且实际预演确认 open/move_aside 可以恢复时，才注入
-  一次。实际选中的 source/target 会记录到 step 的 runtime_selection 和 spec。
+  manifest v5 的 add_occlusion 不固定发生在 step 1。运行时从第 3 个模型 step
+  起，在任务进度 10%～80% 的窗口内持续检查候选，并预演遮挡和恢复。v5 还加入
+  两类 add_object：源目标满足后动态继承局部成功标准，以及容器达到 max_items 后
+  引入 task goal 已引用但初始图缺失的对象。任务组可以只启用第二类；整理玩具A/B就是
+  这种情况。旧 episode 不满足第二类前置条件时，
+  条目保留为 eligible=false，并记录 ineligible_reason。
 
   先预览而不写文件：
 

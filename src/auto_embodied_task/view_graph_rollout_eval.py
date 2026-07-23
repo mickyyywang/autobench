@@ -10,17 +10,24 @@ import random
 from typing import Any, Callable
 
 from .brain import BrainHarness, BrainPolicy, BrainPolicyConfig, BrainRequest
+from .episode_sources import episode_from_manifest_source
 from .harness import (
     OCCLUSION_RELATIONS,
     FailureInjectionConfig,
+    NodeState,
     ParsedAction,
     SymbolicBackend,
+    _append_goal_conjunct,
     _new_visible_nodes,
+    _node_to_condition_object_spec,
+    _project_goal_expression,
+    _replace_goal_subject,
     _state_hash,
     _timestamped_output_path,
     _valid_teacher_actions,
 )
-from .models import Edge, normalize_relation
+from .goal import evaluate_goal_expression, normalize_goal_expression
+from .models import Edge, Node, normalize_relation
 from .real_observation_eval import (
     CAPABILITY_METRIC_VERSION,
     RealObservationAdapter,
@@ -44,14 +51,47 @@ from .real_observation_eval import (
 
 
 CLOSED_LOOP_EVALUATION_TYPE = "closed_loop_visible_graph"
-CLOSED_LOOP_METRIC_VERSION = 3
+CLOSED_LOOP_METRIC_VERSION = 4
 CLOSED_LOOP_MODE = "visible_graph_only"
 
+# Visible-graph state is refreshed automatically before every model action.  Actions
+# that only refresh the observation or mutate hidden focus/inspection bookkeeping
+# therefore cannot reveal a node, change task state, or reduce planning cost in this
+# evaluator. Keep one explicit `observe` action as a deliberate wait/refresh option,
+# while removing redundant focus-only variants that encouraged long no-progress
+# loops.
+CLOSED_LOOP_EXECUTABLE_ACTIONS = frozenset(
+    {
+        "observe",
+        "open",
+        "close",
+        "press",
+        "grab",
+        "attach",
+        "puton",
+        "putin",
+        "move_aside",
+        "stop",
+    }
+)
+RUNTIME_OCCLUSION_SELECTIONS = frozenset(
+    {
+        # Legacy manifests remain executable with the corrected selection policy.
+        "runtime_first_eligible",
+        "runtime_prefer_open_then_first_eligible",
+    }
+)
+RUNTIME_STATE_REGRESSION_SELECTION = "runtime_first_eligible_state_regression"
+RUNTIME_COMPLETED_ROLLBACK_SELECTION = "runtime_first_satisfied_goal_placement"
+RUNTIME_WRONG_RELOCATION_SELECTION = "runtime_first_satisfied_goal_wrong_destination"
+
 GRAPH_DISTURBANCE_OPERATIONS = {
+    "add_object",
     "set_state",
     "relocate",
     "set_capacity",
     "add_occlusion",
+    "relocate_and_add_occlusion",
     "remove_occlusion",
 }
 GRAPH_DISTURBANCE_STATE_FIELDS = {
@@ -74,6 +114,7 @@ class ViewGraphRolloutEvalConfig:
     api_key_env: str | None = None
     api_base_url: str | None = None
     api_style: str = "auto"
+    json_response_format: bool = True
     temperature: float = 0.0
     max_output_tokens: int = 2048
     timeout_seconds: int = 120
@@ -220,11 +261,131 @@ def _normalize_graph_disturbance(
             raise ValueError(
                 f"{source}: disturbance {index} relocate relation and target must both be set or null"
             )
+    if operation == "add_object":
+        object_spec = normalized.get("object")
+        if not isinstance(object_spec, dict):
+            raise ValueError(
+                f"{source}: disturbance {index} add_object needs an object definition"
+            )
+        if not object_spec.get("id"):
+            raise ValueError(
+                f"{source}: disturbance {index} add_object object needs a unique id"
+            )
+        if not object_spec.get("name") and not object_spec.get("copy_from"):
+            raise ValueError(
+                f"{source}: disturbance {index} add_object object needs name or copy_from"
+            )
+        relation = normalize_relation(str(normalized.get("relation") or ""))
+        relation = "INSIDE" if relation == "IN" else relation
+        if relation not in {"ON", "INSIDE", "BENEATH"} or not normalized.get("target"):
+            raise ValueError(
+                f"{source}: disturbance {index} add_object needs relation "
+                "ON/INSIDE/BENEATH and target"
+            )
+        normalized["relation"] = relation
+        component_ids = {str(object_spec["id"])}
+        raw_components = normalized.get("component_objects", [])
+        if not isinstance(raw_components, list):
+            raise ValueError(
+                f"{source}: disturbance {index} add_object component_objects must be a list"
+            )
+        components: list[dict[str, Any]] = []
+        for component_index, raw_component in enumerate(raw_components, start=1):
+            if not isinstance(raw_component, dict):
+                raise ValueError(
+                    f"{source}: disturbance {index} component {component_index} "
+                    "must be an object"
+                )
+            component = copy.deepcopy(raw_component)
+            component_spec = component.get("object")
+            if not isinstance(component_spec, dict) or not component_spec.get("id"):
+                raise ValueError(
+                    f"{source}: disturbance {index} component {component_index} "
+                    "needs object.id"
+                )
+            if not component_spec.get("name") and not component_spec.get("copy_from"):
+                raise ValueError(
+                    f"{source}: disturbance {index} component {component_index} "
+                    "needs object.name or object.copy_from"
+                )
+            component_id = str(component_spec["id"])
+            if component_id in component_ids:
+                raise ValueError(
+                    f"{source}: disturbance {index} reuses add_object id {component_id!r}"
+                )
+            component_ids.add(component_id)
+            component_relation = normalize_relation(
+                str(component.get("relation") or "")
+            )
+            component_relation = (
+                "INSIDE" if component_relation == "IN" else component_relation
+            )
+            if (
+                component_relation not in {"ON", "INSIDE", "BENEATH"}
+                or not component.get("target")
+            ):
+                raise ValueError(
+                    f"{source}: disturbance {index} component {component_index} "
+                    "needs relation ON/INSIDE/BENEATH and target"
+                )
+            component["relation"] = component_relation
+            components.append(component)
+        normalized["component_objects"] = components
+        success_policy = normalized.get("success_policy")
+        if not isinstance(success_policy, dict):
+            raise ValueError(
+                f"{source}: disturbance {index} add_object needs success_policy"
+            )
+        policy_type = str(success_policy.get("type") or "").strip().lower()
+        if policy_type not in {
+            "inherit_from",
+            "existing_task_goal",
+            "trigger_container_goal",
+        }:
+            raise ValueError(
+                f"{source}: disturbance {index} add_object success_policy.type must be "
+                "inherit_from, existing_task_goal, or trigger_container_goal"
+            )
+        if policy_type == "inherit_from":
+            source_ref = success_policy.get("source_node_id") or object_spec.get("copy_from")
+            if not source_ref:
+                raise ValueError(
+                    f"{source}: disturbance {index} inherit_from needs source_node_id"
+                )
+            success_policy["source_node_id"] = source_ref
+            placement_alternatives = success_policy.get("placement_alternatives", [])
+            if not isinstance(placement_alternatives, list) or any(
+                not str(value).strip() for value in placement_alternatives
+            ):
+                raise ValueError(
+                    f"{source}: disturbance {index} inherit_from "
+                    "placement_alternatives must be an array of node ids"
+                )
+            success_policy["placement_alternatives"] = [
+                str(value) for value in placement_alternatives
+            ]
+        if policy_type == "trigger_container_goal":
+            predicate = normalize_relation(
+                str(success_policy.get("predicate") or "INSIDE")
+            )
+            if predicate == "IN":
+                predicate = "INSIDE"
+            if predicate != "INSIDE":
+                raise ValueError(
+                    f"{source}: disturbance {index} trigger_container_goal only "
+                    "supports predicate INSIDE"
+                )
+            success_policy["predicate"] = predicate
+        success_policy["type"] = policy_type
+        normalized["success_policy"] = success_policy
     if operation == "set_capacity":
         max_items = normalized.get("max_items")
         if isinstance(max_items, bool) or not isinstance(max_items, int) or max_items < 0:
             raise ValueError(f"{source}: disturbance {index} max_items must be a non-negative integer")
-    if operation == "add_occlusion" and normalized.get("selection") == "runtime_first_eligible":
+    if (
+        operation == "add_occlusion"
+        and normalized.get("selection") in RUNTIME_OCCLUSION_SELECTIONS
+    ):
         raw_candidates = normalized.get("candidate_pairs")
         if not isinstance(raw_candidates, list) or not raw_candidates:
             raise ValueError(
@@ -267,6 +428,26 @@ def _normalize_graph_disturbance(
             candidate["supported_resolution_actions"] = list(dict.fromkeys(actions))
             candidates.append(candidate)
         normalized["candidate_pairs"] = candidates
+    elif operation == "relocate_and_add_occlusion":
+        required = ("source", "target", "staging_relation", "staging_target", "previous_location")
+        missing = [field for field in required if normalized.get(field) is None]
+        if missing:
+            raise ValueError(
+                f"{source}: disturbance {index} relocate_and_add_occlusion needs "
+                f"{', '.join(missing)}"
+            )
+        staging_relation = normalize_relation(str(normalized["staging_relation"]))
+        if staging_relation != "ON":
+            raise ValueError(
+                f"{source}: disturbance {index} relocate_and_add_occlusion "
+                "staging_relation must be ON"
+            )
+        normalized["staging_relation"] = staging_relation
+        if not isinstance(normalized["previous_location"], dict):
+            raise ValueError(
+                f"{source}: disturbance {index} relocate_and_add_occlusion "
+                "previous_location must be an object"
+            )
     elif operation in {"add_occlusion", "remove_occlusion"}:
         if not normalized.get("source") or not normalized.get("target"):
             raise ValueError(f"{source}: disturbance {index} {operation} needs source and target")
@@ -286,19 +467,45 @@ def load_intervention_manifest(path: str | Path) -> dict[str, Any]:
     if manifest.get("manifest_type") != "closed_loop_intervention_suite":
         raise ValueError(f"{source}: unsupported manifest_type")
     source_config = manifest.get("source")
-    if not isinstance(source_config, dict) or not source_config.get("aligned_episode"):
-        raise ValueError(f"{source}: manifest source.aligned_episode is required")
-    aligned_episode = Path(str(source_config["aligned_episode"]))
-    if not aligned_episode.is_file():
-        raise ValueError(f"{source}: aligned episode does not exist: {aligned_episode}")
-    expected_sha256 = source_config.get("sha256")
-    if expected_sha256:
-        actual_sha256 = hashlib.sha256(aligned_episode.read_bytes()).hexdigest()
-        if str(expected_sha256) != actual_sha256:
-            raise ValueError(
-                f"{source}: aligned episode sha256 mismatch: expected {expected_sha256}, "
-                f"got {actual_sha256}"
+    if not isinstance(source_config, dict):
+        raise ValueError(f"{source}: manifest source must be an object")
+    source_type = str(
+        source_config.get("source_type")
+        or ("aligned_episode" if source_config.get("aligned_episode") else "")
+    )
+    if source_type == "aligned_episode":
+        if not source_config.get("aligned_episode"):
+            raise ValueError(f"{source}: manifest source.aligned_episode is required")
+        aligned_episode = Path(str(source_config["aligned_episode"]))
+        if not aligned_episode.is_file():
+            raise ValueError(f"{source}: aligned episode does not exist: {aligned_episode}")
+        _validate_source_hash(
+            source=source,
+            data_path=aligned_episode,
+            expected=source_config.get("sha256"),
+            field="aligned episode",
+        )
+        source_config["source_type"] = "aligned_episode"
+        source_config["aligned_episode"] = str(aligned_episode.resolve())
+    elif source_type == "view_graph_and_task":
+        for field, hash_field, label in (
+            ("view_graph", "view_graph_sha256", "view graph"),
+            ("tasks", "tasks_sha256", "tasks"),
+        ):
+            data_path = Path(str(source_config.get(field) or ""))
+            if not data_path.is_file():
+                raise ValueError(f"{source}: {label} does not exist: {data_path}")
+            _validate_source_hash(
+                source=source,
+                data_path=data_path,
+                expected=source_config.get(hash_field),
+                field=label,
             )
+            source_config[field] = str(data_path.resolve())
+    else:
+        raise ValueError(
+            f"{source}: source_type must be aligned_episode or view_graph_and_task"
+        )
     raw_conditions = manifest.get("conditions")
     if not isinstance(raw_conditions, list) or not raw_conditions:
         raise ValueError(f"{source}: manifest conditions must be a non-empty array")
@@ -338,6 +545,47 @@ def load_intervention_manifest(path: str | Path) -> dict[str, Any]:
             )
             if not isinstance(condition.get("trigger"), dict):
                 raise ValueError(f"{source}: condition {condition_id} needs a trigger")
+            trigger_type = str(condition["trigger"].get("type") or "").strip().lower()
+            if condition["graph_disturbance"].get("operation") == "add_object":
+                policy_type = condition["graph_disturbance"]["success_policy"]["type"]
+                expected_triggers = (
+                    {"on_object_goal_satisfied", "first_goal_progress_opportunity"}
+                    if policy_type == "inherit_from"
+                    else {
+                        "on_any_container_max_items_reached"
+                        if policy_type == "trigger_container_goal"
+                        else "on_container_max_items_reached"
+                    }
+                )
+                if trigger_type not in expected_triggers:
+                    raise ValueError(
+                        f"{source}: condition {condition_id} add_object policy "
+                        f"{policy_type} requires trigger type in "
+                        f"{sorted(expected_triggers)}"
+                    )
+            if trigger_type == "on_any_container_max_items_reached":
+                node_ids = condition["trigger"].get("node_ids")
+                if not isinstance(node_ids, list) or not node_ids:
+                    raise ValueError(
+                        f"{source}: condition {condition_id} trigger needs a "
+                        "non-empty node_ids array"
+                    )
+                condition["trigger"]["node_ids"] = [
+                    str(node_id) for node_id in node_ids
+                ]
+            required_predicates = condition["trigger"].get(
+                "required_predicates", []
+            )
+            if not isinstance(required_predicates, list):
+                raise ValueError(
+                    f"{source}: condition {condition_id} trigger.required_predicates "
+                    "must be a list"
+                )
+            if any(not isinstance(item, (dict, list)) for item in required_predicates):
+                raise ValueError(
+                    f"{source}: condition {condition_id} trigger.required_predicates "
+                    "entries must be goal expressions"
+                )
         cleanup = condition.get("cleanup")
         if cleanup is not None:
             condition["cleanup"] = _normalize_graph_disturbance(
@@ -351,9 +599,25 @@ def load_intervention_manifest(path: str | Path) -> dict[str, Any]:
         conditions.append(condition)
     normalized = copy.deepcopy(manifest)
     normalized["_manifest_path"] = str(source.resolve())
-    normalized["source"]["aligned_episode"] = str(aligned_episode.resolve())
+    normalized["source"] = copy.deepcopy(source_config)
     normalized["conditions"] = conditions
     return normalized
+
+
+def _validate_source_hash(
+    *,
+    source: Path,
+    data_path: Path,
+    expected: Any,
+    field: str,
+) -> None:
+    if not expected:
+        return
+    actual = hashlib.sha256(data_path.read_bytes()).hexdigest()
+    if str(expected) != actual:
+        raise ValueError(
+            f"{source}: {field} sha256 mismatch: expected {expected}, got {actual}"
+        )
 
 
 class ClosedLoopVisibleGraphAdapter(RealObservationAdapter):
@@ -366,7 +630,9 @@ class ClosedLoopVisibleGraphAdapter(RealObservationAdapter):
         payload = json.loads(content[0]["text"])
         action_catalog = payload.get("action_catalog")
         if isinstance(action_catalog, dict):
-            action_catalog.pop("recover", None)
+            for action_name in list(action_catalog):
+                if action_name not in CLOSED_LOOP_EXECUTABLE_ACTIONS:
+                    action_catalog.pop(action_name, None)
         payload["recent_history"] = copy.deepcopy(list(kwargs.get("history") or [])[-self.history_window :])
         constraints = payload.get("action_constraints")
         if isinstance(constraints, list):
@@ -398,6 +664,8 @@ class _ManifestInterventionRuntime:
         self.cleanup_applied = False
         self.cleanup_pending = False
         self.model_actions_since_primary = 0
+        self.added_object_goal_expression: Any | None = None
+        self.added_object_goal_activation_step: int | None = None
 
     @property
     def condition_id(self) -> str | None:
@@ -445,7 +713,7 @@ class _ManifestInterventionRuntime:
 
         disturbance = self.condition.get("graph_disturbance")
         trigger = self.condition.get("trigger")
-        if (
+        trigger_matches = bool(
             not self.primary_applied
             and isinstance(disturbance, dict)
             and isinstance(trigger, dict)
@@ -456,8 +724,31 @@ class _ManifestInterventionRuntime:
                 history=history,
                 initial_completion_cost=self.initial_completion_cost,
             )
+        )
+        if (
+            not self.primary_applied
+            and isinstance(disturbance, dict)
+            and isinstance(trigger, dict)
+            and trigger_matches
         ):
-            materialized = _materialize_manifest_disturbance(backend, disturbance)
+            disturbance_for_apply = copy.deepcopy(disturbance)
+            success_policy = disturbance_for_apply.get("success_policy")
+            if (
+                disturbance_for_apply.get("operation") == "add_object"
+                and isinstance(success_policy, dict)
+                and success_policy.get("type") == "trigger_container_goal"
+            ):
+                trigger_container_id = _matching_manifest_trigger_container(
+                    trigger,
+                    backend=backend,
+                )
+                if trigger_container_id is None:
+                    return reports
+                success_policy["trigger_container_id"] = trigger_container_id
+            materialized = _materialize_manifest_disturbance(
+                backend,
+                disturbance_for_apply,
+            )
             if materialized is None:
                 return reports
             applied_disturbance, runtime_selection = materialized
@@ -473,6 +764,20 @@ class _ManifestInterventionRuntime:
             report["condition_id"] = self.condition_id
             report["intervention_type"] = self.intervention_type
             reports.append(report)
+            if report.get("operation") == "add_object":
+                details = report.get("details")
+                goal_update = (
+                    details.get("goal_update") if isinstance(details, dict) else None
+                )
+                if isinstance(goal_update, dict):
+                    expression = (
+                        goal_update["added_expression"]
+                        if "added_expression" in goal_update
+                        else goal_update.get("existing_expression")
+                    )
+                    if expression is not None:
+                        self.added_object_goal_expression = copy.deepcopy(expression)
+                        self.added_object_goal_activation_step = step_number
             self.primary_applied = True
             if isinstance(cleanup, dict):
                 self.cleanup_pending = True
@@ -482,6 +787,40 @@ class _ManifestInterventionRuntime:
     def after_model_action(self) -> None:
         if self.cleanup_pending:
             self.model_actions_since_primary += 1
+
+
+def _goal_expression_satisfied(
+    backend: SymbolicBackend,
+    expression: Any | None,
+) -> bool | None:
+    if expression is None:
+        return None
+    return bool(
+        evaluate_goal_expression(
+            normalize_goal_expression(expression),
+            backend.evaluator._predicate_met,
+        ).success
+    )
+
+
+def _manifest_goal_for_node(
+    backend: SymbolicBackend,
+    node_ref: Any,
+    *,
+    field: str,
+) -> tuple[Any, str]:
+    node_id = backend.world.resolve_node_id(node_ref)
+    if node_id is None:
+        raise ValueError(f"manifest add_object has unknown {field}: {node_ref!r}")
+    projected = _project_goal_expression(
+        backend.evaluator.task.task_completion_criterion,
+        lambda raw: backend.world.resolve_node_id(raw) == node_id,
+    )
+    if projected is None:
+        raise ValueError(
+            f"manifest add_object cannot find a success criterion whose subject is {node_id!r}"
+        )
+    return projected, node_id
 
 
 def _manifest_trigger_matches(
@@ -521,6 +860,61 @@ def _manifest_trigger_matches(
             raise ValueError(f"manifest trigger has unknown container: {trigger.get('node_id')!r}")
         wanted_count = int(trigger.get("item_count", -1))
         return backend.world._container_item_count(node_id) == wanted_count
+    if trigger_type == "on_container_max_items_reached":
+        node_id = backend.world.resolve_node_id(trigger.get("node_id"))
+        if node_id is None:
+            raise ValueError(f"manifest trigger has unknown container: {trigger.get('node_id')!r}")
+        state = backend.world.states[node_id]
+        if not state.node.is_container:
+            raise ValueError(f"manifest trigger node is not a container: {node_id}")
+        max_items = state.node.max_items
+        if max_items is None:
+            raise ValueError(f"manifest trigger container has no max_items: {node_id}")
+        return backend.world._container_item_count(node_id) >= max_items
+    if trigger_type == "on_any_container_max_items_reached":
+        return _matching_manifest_trigger_container(trigger, backend=backend) is not None
+    if trigger_type == "on_object_goal_satisfied":
+        expression, _ = _manifest_goal_for_node(
+            backend,
+            trigger.get("node_id"),
+            field="trigger.node_id",
+        )
+        if not evaluate_goal_expression(
+            expression,
+            backend.evaluator._predicate_met,
+        ).success:
+            return False
+        required_predicates = trigger.get("required_predicates", [])
+        if not isinstance(required_predicates, list):
+            raise ValueError("manifest trigger required_predicates must be a list")
+        return all(
+            evaluate_goal_expression(
+                required,
+                backend.evaluator._predicate_met,
+            ).success
+            for required in required_predicates
+        )
+    if trigger_type in {
+        "first_eligible_state_regression_opportunity",
+        "first_satisfied_goal_placement_opportunity",
+        "first_satisfied_goal_wrong_destination_opportunity",
+    }:
+        # Candidate eligibility is evaluated against the live world by
+        # _materialize_manifest_disturbance.  Returning true here makes the
+        # runtime retry on every later step until one semantic opportunity
+        # exists, instead of tying the condition to a teacher action/step.
+        return step_number >= int(trigger.get("minimum_step", 2))
+    if trigger_type == "first_goal_progress_opportunity":
+        if step_number < int(trigger.get("minimum_step", 2)):
+            return False
+        if initial_completion_cost is None or initial_completion_cost <= 0:
+            return False
+        current_cost = _relaxed_completion_cost(backend)
+        progress = max(
+            0.0,
+            min(1.0, (initial_completion_cost - current_cost) / initial_completion_cost),
+        )
+        return progress >= float(trigger.get("min_goal_progress", 0.01))
     if trigger_type == "first_eligible_occlusion_opportunity":
         minimum_step = int(trigger.get("minimum_step", 3))
         if step_number < minimum_step or bool(_safe_backend_success(backend)):
@@ -543,32 +937,258 @@ def _manifest_trigger_matches(
     raise ValueError(f"unsupported manifest trigger type: {trigger_type!r}")
 
 
+def _matching_manifest_trigger_container(
+    trigger: dict[str, Any],
+    *,
+    backend: SymbolicBackend,
+) -> str | None:
+    node_refs = trigger.get("node_ids")
+    if not isinstance(node_refs, list) or not node_refs:
+        raise ValueError("manifest any-container trigger needs a non-empty node_ids array")
+    for node_ref in node_refs:
+        node_id = backend.world.resolve_node_id(node_ref)
+        if node_id is None:
+            raise ValueError(f"manifest trigger has unknown container: {node_ref!r}")
+        state = backend.world.states[node_id]
+        if not state.node.is_container:
+            raise ValueError(f"manifest trigger node is not a container: {node_id}")
+        max_items = state.node.max_items
+        if max_items is None:
+            raise ValueError(f"manifest trigger container has no max_items: {node_id}")
+        if backend.world._container_item_count(node_id) >= max_items:
+            return node_id
+    return None
+
+
 def _materialize_manifest_disturbance(
     backend: SymbolicBackend,
     disturbance: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    selection = disturbance.get("selection")
+    if selection == RUNTIME_STATE_REGRESSION_SELECTION:
+        return _materialize_runtime_state_regression(backend, disturbance)
+    if selection == RUNTIME_COMPLETED_ROLLBACK_SELECTION:
+        return _materialize_runtime_completed_rollback(backend, disturbance)
+    if selection == RUNTIME_WRONG_RELOCATION_SELECTION:
+        return _materialize_runtime_wrong_relocation(backend, disturbance)
     if not (
         disturbance.get("operation") == "add_occlusion"
-        and disturbance.get("selection") == "runtime_first_eligible"
+        and selection in RUNTIME_OCCLUSION_SELECTIONS
     ):
         return copy.deepcopy(disturbance), None
 
     candidates = disturbance.get("candidate_pairs")
     if not isinstance(candidates, list):
         return None
+    eligible: list[tuple[int, dict[str, Any]]] = []
     for candidate_index, candidate in enumerate(candidates):
         if not isinstance(candidate, dict):
             continue
         spec = _eligible_runtime_occlusion_spec(backend, candidate)
         if spec is None:
             continue
+        eligible.append((candidate_index, spec))
+    if not eligible:
+        return None
+
+    # Closed openable occluders exercise a distinct and more constrained recovery
+    # than a movable bag.  Candidate order previously made a movable bag win even
+    # when several closed drawers were eligible later in the list.  Prefer an
+    # executable `open` resolution, retaining manifest order within each class and
+    # falling back to `move_aside` when no closed openable source is available.
+    candidate_index, spec = min(
+        eligible,
+        key=lambda item: (
+            0 if item[1]["resolution_action"] == "open" else 1,
+            item[0],
+        ),
+    )
+    return spec, {
+        "strategy": "runtime_prefer_open_then_first_eligible",
+        "selection_priority": "open_before_move_aside",
+        "candidate_index": candidate_index,
+        "eligible_candidate_count": len(eligible),
+        "candidate_count": len(candidates),
+        "source": spec["source"],
+        "target": spec["target"],
+        "resolution_action": spec["resolution_action"],
+        "restore_source_action": spec.get("restore_source_action"),
+        "previous_location": copy.deepcopy(spec["previous_location"]),
+        "staging_location": {
+            "relation": spec["staging_relation"],
+            "target": spec["staging_target"],
+        },
+    }
+
+
+def _materialize_runtime_state_regression(
+    backend: SymbolicBackend,
+    disturbance: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    candidates = disturbance.get("candidate_regressions")
+    if not isinstance(candidates, list):
+        return None
+    for candidate_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        node_id = backend.world.resolve_node_id(candidate.get("node_id"))
+        values = candidate.get("values")
+        achieved_values = candidate.get("achieved_values")
+        if (
+            node_id is None
+            or not isinstance(values, dict)
+            or not values
+            or not isinstance(achieved_values, dict)
+        ):
+            continue
+        state = backend.world.states[node_id]
+        if not all(
+            hasattr(state, field) and getattr(state, field) == wanted
+            for field, wanted in achieved_values.items()
+        ) or not backend.world.is_visible(node_id):
+            continue
+        spec = {
+            "operation": "set_state",
+            "node_id": node_id,
+            "values": copy.deepcopy(values),
+        }
+        trial = copy.deepcopy(backend)
+        cost_before = _relaxed_completion_cost(trial)
+        planning_cost_before = _planning_completion_cost(trial)
+        try:
+            _apply_graph_disturbance(trial, spec)
+            cost_after_disturbance = _relaxed_completion_cost(trial)
+            planning_cost_after_disturbance = _planning_completion_cost(trial)
+            recovery_action = candidate.get("recovery_action")
+            recovery_event = (
+                trial.step(_parsed_action(recovery_action))
+                if isinstance(recovery_action, dict)
+                else {"status": "failure"}
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            (
+                cost_after_disturbance <= cost_before
+                and planning_cost_after_disturbance <= planning_cost_before
+            )
+            or
+            recovery_event.get("status") != "success"
+            or _relaxed_completion_cost(trial) > cost_before
+            or _planning_completion_cost(trial) > planning_cost_before
+        ):
+            continue
         return spec, {
-            "strategy": "runtime_first_eligible",
+            "strategy": RUNTIME_STATE_REGRESSION_SELECTION,
             "candidate_index": candidate_index,
             "candidate_count": len(candidates),
-            "source": spec["source"],
-            "target": spec["target"],
-            "resolution_action": spec["resolution_action"],
+            "node_id": node_id,
+            "recovery_action": copy.deepcopy(candidate.get("recovery_action")),
+        }
+    return None
+
+
+def _materialize_runtime_completed_rollback(
+    backend: SymbolicBackend,
+    disturbance: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    candidates = disturbance.get("candidate_relocations")
+    if not isinstance(candidates, list):
+        return None
+    for candidate_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        node_id = backend.world.resolve_node_id(candidate.get("node_id"))
+        target_id = backend.world.resolve_node_id(candidate.get("target"))
+        if node_id is None or target_id is None:
+            continue
+        previous_location = _satisfied_goal_placement(backend, node_id)
+        state = backend.world.states[node_id]
+        if previous_location is None or state.held or not backend.world.is_visible(node_id):
+            continue
+        if previous_location["relation"] == "ON" and previous_location["target"] == target_id:
+            continue
+        spec = {
+            "operation": "relocate",
+            "node_id": node_id,
+            "relation": "ON",
+            "target": target_id,
+        }
+        trial = copy.deepcopy(backend)
+        cost_before = _relaxed_completion_cost(trial)
+        try:
+            _apply_graph_disturbance(trial, spec)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if _relaxed_completion_cost(trial) <= cost_before or not trial.world.is_visible(node_id):
+            continue
+        return spec, {
+            "strategy": RUNTIME_COMPLETED_ROLLBACK_SELECTION,
+            "candidate_index": candidate_index,
+            "candidate_count": len(candidates),
+            "node_id": node_id,
+            "previous_location": previous_location,
+            "recovery_action": {
+                "name": "putin" if previous_location["relation"] == "INSIDE" else "puton",
+                "node_ids": [node_id, previous_location["target"]],
+            },
+        }
+    return None
+
+
+def _materialize_runtime_wrong_relocation(
+    backend: SymbolicBackend,
+    disturbance: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    candidates = disturbance.get("candidate_relocations")
+    if not isinstance(candidates, list):
+        return None
+    for candidate_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            continue
+        node_id = backend.world.resolve_node_id(candidate.get("node_id"))
+        target_id = backend.world.resolve_node_id(candidate.get("target"))
+        relation = normalize_relation(str(candidate.get("relation") or ""))
+        relation = "INSIDE" if relation == "IN" else relation
+        if node_id is None or target_id is None or relation not in {"ON", "INSIDE"}:
+            continue
+        previous_location = _satisfied_goal_placement(backend, node_id)
+        state = backend.world.states[node_id]
+        target_state = backend.world.states[target_id]
+        if previous_location is None or state.held or target_id == previous_location["target"]:
+            continue
+        if relation == "INSIDE" and (
+            (target_state.node.is_openable and not target_state.open)
+            or backend.world._container_is_full(target_id)
+        ):
+            continue
+        if not backend.world.is_visible(target_id):
+            continue
+        spec = {
+            "operation": "relocate",
+            "node_id": node_id,
+            "relation": relation,
+            "target": target_id,
+        }
+        trial = copy.deepcopy(backend)
+        cost_before = _relaxed_completion_cost(trial)
+        try:
+            _apply_graph_disturbance(trial, spec)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if _relaxed_completion_cost(trial) <= cost_before or not trial.world.is_visible(node_id):
+            continue
+        return spec, {
+            "strategy": RUNTIME_WRONG_RELOCATION_SELECTION,
+            "candidate_index": candidate_index,
+            "candidate_count": len(candidates),
+            "node_id": node_id,
+            "previous_location": previous_location,
+            "wrong_location": {"relation": relation, "target": target_id},
+            "recovery_action": {
+                "name": "putin" if previous_location["relation"] == "INSIDE" else "puton",
+                "node_ids": [node_id, previous_location["target"]],
+            },
         }
     return None
 
@@ -592,9 +1212,17 @@ def _eligible_runtime_occlusion_spec(
     target_state = world.states[target_id]
     if source_state.held or target_state.held:
         return None
-    if not _goal_node_is_currently_unsatisfied(backend, target_id):
+    previous_location = _satisfied_goal_placement(backend, target_id)
+    if previous_location is None:
         return None
-    if not _occlusion_pair_is_spatially_plausible(source_state, target_state):
+    source_surface = _root_support_surface(world, source_id)
+    target_surface = _root_support_surface(world, target_id)
+    if source_surface is None or source_surface != target_surface:
+        return None
+    if (
+        previous_location["relation"] == "ON"
+        and previous_location["target"] == source_surface
+    ):
         return None
 
     relation = normalize_relation(str(candidate.get("relation") or "OCCLUDES"))
@@ -618,72 +1246,137 @@ def _eligible_runtime_occlusion_spec(
     elif (
         "move_aside" in supported_actions
         and source_state.node.is_movable
-        and not source_state.moved_aside
     ):
+        # A new external occlusion can move a previously cleared occluder back
+        # into the way. add_occlusion(activate=True) resets moved_aside=False,
+        # so the model must resolve this newly introduced obstruction again.
         resolution_action = "move_aside"
     if resolution_action is None:
         return None
 
     spec = {
-        "operation": "add_occlusion",
+        "operation": "relocate_and_add_occlusion",
         "source": source_id,
         "target": target_id,
         "relation": relation,
         "resolution_action": resolution_action,
+        "restore_source_action": (
+            "close" if resolution_action == "open" and not source_state.open else None
+        ),
         "activate": True,
+        "previous_location": previous_location,
+        "staging_relation": "ON",
+        "staging_target": source_surface,
     }
     trial = copy.deepcopy(backend)
+    cost_before = _relaxed_completion_cost(trial)
+    planning_cost_before = _planning_completion_cost(trial)
     try:
         details = _apply_graph_disturbance(trial, spec)
-        if details.get("active_after") is not True or trial.world.is_visible(target_id):
+        occlusion_details = details.get("occlusion") or {}
+        if (
+            occlusion_details.get("active_after") is not True
+            or trial.world.is_visible(target_id)
+            or _relaxed_completion_cost(trial) <= cost_before
+            or _planning_completion_cost(trial) <= planning_cost_before
+        ):
             return None
         recovery_event = trial.step(
             _parsed_action({"name": resolution_action, "node_ids": [source_id]})
         )
+        if recovery_event.get("status") != "success" or not trial.world.is_visible(target_id):
+            return None
+        grab_event = trial.step(_parsed_action({"name": "grab", "node_ids": [target_id]}))
+        if grab_event.get("status") != "success":
+            return None
+        placement_target = str(previous_location["target"])
+        placement_target_state = trial.world.states[placement_target]
+        if (
+            previous_location["relation"] == "INSIDE"
+            and placement_target_state.node.is_openable
+            and not placement_target_state.open
+        ):
+            # Opening while holding is disallowed, so a target that unexpectedly
+            # became closed is not a recoverable candidate for this intervention.
+            return None
+        placement_action = "putin" if previous_location["relation"] == "INSIDE" else "puton"
+        placement_event = trial.step(
+            _parsed_action(
+                {
+                    "name": placement_action,
+                    "node_ids": [target_id, placement_target],
+                }
+            )
+        )
+        restore_source_event: dict[str, Any] | None = None
+        if spec["restore_source_action"] is not None:
+            restore_source_event = trial.step(
+                _parsed_action(
+                    {
+                        "name": spec["restore_source_action"],
+                        "node_ids": [source_id],
+                    }
+                )
+            )
     except (KeyError, TypeError, ValueError):
         return None
-    if recovery_event.get("status") != "success" or not trial.world.is_visible(target_id):
+    if (
+        placement_event.get("status") != "success"
+        or (
+            restore_source_event is not None
+            and restore_source_event.get("status") != "success"
+        )
+        or _relaxed_completion_cost(trial) > cost_before
+        or _planning_completion_cost(trial) > planning_cost_before
+    ):
         return None
     return spec
 
 
-def _goal_node_is_currently_unsatisfied(
+def _satisfied_goal_placement(
     backend: SymbolicBackend,
     node_id: str,
-) -> bool:
+) -> dict[str, str] | None:
+    """Return the exact currently satisfied ON/INSIDE goal leaf for a node.
+
+    Goal leaves are checked independently so a satisfied branch of an OR is not
+    rejected merely because its alternative destinations are false.
+    """
+    state = backend.world.states[node_id]
     criterion = backend.evaluator.task.task_completion_criterion
     for predicate, args in _goal_atoms(criterion):
-        resolved_ids: set[str] = set()
-
-        def collect(value: Any) -> None:
-            if isinstance(value, (list, tuple)):
-                for item in value:
-                    collect(item)
-                return
-            resolved = backend.world.resolve_node_id(value)
-            if resolved is not None:
-                resolved_ids.add(resolved)
-
-        for argument in args:
-            collect(argument)
-        if node_id not in resolved_ids:
+        relation = "INSIDE" if predicate == "IN" else predicate
+        if relation not in {"ON", "INSIDE"} or len(args) < 2:
+            continue
+        object_id = backend.world.resolve_node_id(args[0])
+        target_id = backend.world.resolve_node_id(args[1])
+        if object_id != node_id or target_id is None:
+            continue
+        if state.location_relation != relation or state.location_target != target_id:
             continue
         try:
-            if not backend.evaluator._predicate_met(predicate, args):
-                return True
-        except Exception:  # noqa: BLE001 - an unsupported atom is not an eligible target.
+            if backend.evaluator._predicate_met(predicate, args):
+                return {"relation": relation, "target": target_id}
+        except Exception:  # noqa: BLE001 - unsupported leaves are not eligible.
             continue
-    return False
+    return None
 
 
-def _occlusion_pair_is_spatially_plausible(source_state: Any, target_state: Any) -> bool:
-    source_parent = source_state.location_target
-    target_parent = target_state.location_target
-    return bool(
-        source_parent == target_parent
-        or target_parent == source_state.node.id
-        or source_parent == target_state.node.id
-    )
+def _root_support_surface(world: Any, node_id: str) -> str | None:
+    """Find the outermost surface supporting a node through ON/INSIDE ancestry."""
+    current = node_id
+    seen: set[str] = set()
+    outermost_surface: str | None = None
+    while current in world.states and current not in seen:
+        seen.add(current)
+        parent_id = world.states[current].location_target
+        if parent_id is None or parent_id not in world.states:
+            break
+        parent = world.states[parent_id]
+        if parent.node.is_surface:
+            outermost_surface = parent_id
+        current = parent_id
+    return outermost_surface
 
 
 def _manifest_cleanup_due(cleanup: dict[str, Any], model_action_count: int) -> bool:
@@ -755,6 +1448,8 @@ class ClosedLoopViewGraphHarness:
         records: list[dict[str, Any]] = []
         history: list[dict[str, Any]] = []
         first_goal_satisfied_step: int | None = 0 if initial_goal_satisfied else None
+        first_added_object_goal_satisfied_step: int | None = None
+        added_object_goal_model_steps_to_satisfaction: int | None = None
         goal_damaged_after_satisfaction = False
         consecutive_model_errors = 0
         termination_reason = "max_steps"
@@ -783,6 +1478,24 @@ class ClosedLoopViewGraphHarness:
             projected_observation = _visible_graph_observation(observation)
             pre_snapshot = backend.snapshot()
             goal_before = bool(_safe_backend_success(backend))
+            added_object_goal_expression = (
+                intervention_runtime.added_object_goal_expression
+            )
+            added_object_goal_before = _goal_expression_satisfied(
+                backend,
+                added_object_goal_expression,
+            )
+            if (
+                added_object_goal_before is True
+                and first_added_object_goal_satisfied_step is None
+            ):
+                first_added_object_goal_satisfied_step = step_number
+                activation_step = intervention_runtime.added_object_goal_activation_step
+                added_object_goal_model_steps_to_satisfaction = (
+                    step_number - activation_step
+                    if activation_step is not None
+                    else None
+                )
             cost_before = _relaxed_completion_cost(backend)
             planning_cost_before = _planning_completion_cost(backend)
             if first_goal_satisfied_step is not None and not goal_before:
@@ -831,6 +1544,8 @@ class ClosedLoopViewGraphHarness:
                 "predicted_recovery": None,
                 "reason": None,
                 "parse_error": None,
+                "parse_repair": None,
+                "response_metadata": None,
                 "model_error": None,
                 "event": None,
                 "injection_applied": False,
@@ -842,6 +1557,12 @@ class ClosedLoopViewGraphHarness:
                 "post_state_hash": None,
                 "goal_satisfied_before_action": goal_before,
                 "goal_satisfied_after_action": None,
+                "added_object_goal_eligible": added_object_goal_expression is not None,
+                "added_object_goal_expression": copy.deepcopy(
+                    added_object_goal_expression
+                ),
+                "added_object_goal_satisfied_before_action": added_object_goal_before,
+                "added_object_goal_satisfied_after_action": None,
                 "relaxed_completion_cost_before": cost_before,
                 "goal_completion_cost_before": cost_before,
                 "planning_cost_before": planning_cost_before,
@@ -870,6 +1591,10 @@ class ClosedLoopViewGraphHarness:
                         "predicted_recovery": predicted_recovery,
                         "reason": decision.reason,
                         "parse_error": decision.parse_error,
+                        "parse_repair": decision.parse_repair,
+                        "response_metadata": copy.deepcopy(
+                            self.brain_harness.last_response_metadata
+                        ),
                     }
                 )
                 consecutive_model_errors = 0
@@ -879,6 +1604,9 @@ class ClosedLoopViewGraphHarness:
                 model_error = str(exc)
                 decision_parse_error = f"model request failed: {exc}"
                 record["model_error"] = model_error
+                record["response_metadata"] = copy.deepcopy(
+                    self.brain_harness.last_response_metadata
+                )
                 consecutive_model_errors += 1
 
             context = ReplayStepContext(
@@ -989,6 +1717,21 @@ class ClosedLoopViewGraphHarness:
             post_observation = backend.observe()
             post_snapshot = backend.snapshot()
             goal_after = bool(_safe_backend_success(backend))
+            added_object_goal_after = _goal_expression_satisfied(
+                backend,
+                added_object_goal_expression,
+            )
+            if (
+                added_object_goal_after is True
+                and first_added_object_goal_satisfied_step is None
+            ):
+                first_added_object_goal_satisfied_step = step_number
+                activation_step = intervention_runtime.added_object_goal_activation_step
+                added_object_goal_model_steps_to_satisfaction = (
+                    step_number - activation_step + 1
+                    if activation_step is not None
+                    else None
+                )
             cost_after = _relaxed_completion_cost(backend)
             planning_cost_after = _planning_completion_cost(backend)
             new_visible_nodes = _new_visible_nodes(observation, post_observation)
@@ -999,7 +1742,7 @@ class ClosedLoopViewGraphHarness:
 
             handled_opportunities: list[str] = []
             action_name, action_nodes = predicted_key or ("", ())
-            if event.get("status") == "success" and action_name in {"open", "move_aside"} and action_nodes:
+            if event.get("status") == "success" and action_name in {"open", "close", "move_aside"} and action_nodes:
                 opportunity_id = f"{action_name}:{action_nodes[0]}"
                 if opportunity_id in current_opportunities:
                     handled_opportunities.append(opportunity_id)
@@ -1063,6 +1806,7 @@ class ClosedLoopViewGraphHarness:
                     "event": event,
                     "post_state_hash": _state_hash(post_snapshot),
                     "goal_satisfied_after_action": goal_after,
+                    "added_object_goal_satisfied_after_action": added_object_goal_after,
                     "relaxed_completion_cost_after": cost_after,
                     "goal_completion_cost_after": cost_after,
                     "planning_cost_after": planning_cost_after,
@@ -1106,6 +1850,18 @@ class ClosedLoopViewGraphHarness:
                     disturbance_cleanup_count=disturbance_cleanup_count,
                     condition_id=intervention_runtime.condition_id,
                     intervention_type=intervention_runtime.intervention_type,
+                    added_object_goal_expression=(
+                        intervention_runtime.added_object_goal_expression
+                    ),
+                    added_object_goal_activation_step=(
+                        intervention_runtime.added_object_goal_activation_step
+                    ),
+                    first_added_object_goal_satisfied_step=(
+                        first_added_object_goal_satisfied_step
+                    ),
+                    added_object_goal_model_steps_to_satisfaction=(
+                        added_object_goal_model_steps_to_satisfaction
+                    ),
                 )
                 record["rollout_outcome"] = outcome
 
@@ -1125,6 +1881,7 @@ def evaluate_view_graph_rollouts(
     config: ViewGraphRolloutEvalConfig,
     brain_harness: BrainHarness | None = None,
     intervention_condition: dict[str, Any] | None = None,
+    episode_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     source = Path(input_path)
     target = _timestamped_output_path(output_path)
@@ -1144,6 +1901,7 @@ def evaluate_view_graph_rollouts(
                 retry_max_seconds=config.retry_max_seconds,
                 api_style=_resolved_api_style(config.provider, config.api_style),
                 max_output_tokens=config.max_output_tokens,
+                json_response_format=config.json_response_format,
             )
         )
         brain_harness = BrainHarness(policy, adapter)
@@ -1168,21 +1926,27 @@ def evaluate_view_graph_rollouts(
                 flush=True,
             )
 
-        with source.open("r", encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, start=1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                episode = json.loads(stripped)
-                if not isinstance(episode, dict):
-                    raise ValueError(f"{source}:{line_no}: expected JSON object")
-                episode_records, outcome = harness.run_episode(
-                    episode,
-                    source,
-                    record_callback=write_record,
-                )
-                records.extend(episode_records)
-                outcomes.append(outcome)
+        if episode_override is not None:
+            episodes = [copy.deepcopy(episode_override)]
+        else:
+            episodes = []
+            with source.open("r", encoding="utf-8") as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    episode = json.loads(stripped)
+                    if not isinstance(episode, dict):
+                        raise ValueError(f"{source}:{line_no}: expected JSON object")
+                    episodes.append(episode)
+        for episode in episodes:
+            episode_records, outcome = harness.run_episode(
+                episode,
+                source,
+                record_callback=write_record,
+            )
+            records.extend(episode_records)
+            outcomes.append(outcome)
 
     summary = _closed_loop_summary(
         records,
@@ -1222,8 +1986,8 @@ def evaluate_view_graph_intervention_manifest(
     ]
     target_dir = Path(output_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
-    aligned_episode = Path(manifest["source"]["aligned_episode"])
-    episode_id = str(manifest["source"].get("episode_id") or aligned_episode.stem)
+    episode, source_file = episode_from_manifest_source(manifest["source"])
+    episode_id = str(manifest["source"].get("episode_id") or episode["episode_id"])
     variant = "valid_action" if config.include_valid_actions else "no_valid_action"
     model_slug = _filename_slug(config.model or _default_model(config.provider))
 
@@ -1263,11 +2027,12 @@ def evaluate_view_graph_intervention_manifest(
             else None
         )
         result = evaluate_view_graph_rollouts(
-            input_path=aligned_episode,
+            input_path=source_file,
             output_path=output_base,
             config=condition_config,
             brain_harness=brain_harness,
             intervention_condition=condition,
+            episode_override=episode,
         )
         condition_summary = json.loads(Path(result["summary_path"]).read_text(encoding="utf-8"))
         results.append(
@@ -1325,7 +2090,7 @@ def _normal_valid_actions(observation: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         action
         for action in _valid_teacher_actions(observation, [])
-        if action.get("name") != "recover"
+        if action.get("name") in CLOSED_LOOP_EXECUTABLE_ACTIONS
     ]
 
 
@@ -1464,12 +2229,294 @@ def _resolve_disturbance_node_id(backend: SymbolicBackend, reference: Any, field
     return node_id
 
 
+def _copy_from_node_payload(
+    source_node: Node,
+    identity_spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Copy every source attribute while allowing only identity/part ownership changes."""
+    payload = _node_to_condition_object_spec(source_node)
+    for field in ("id", "name"):
+        if identity_spec.get(field) is not None:
+            payload[field] = copy.deepcopy(identity_spec[field])
+    if identity_spec.get("part_of") is not None:
+        payload["part_of"] = copy.deepcopy(identity_spec["part_of"])
+    return payload
+
+
+def _apply_manifest_add_object(
+    backend: SymbolicBackend,
+    disturbance: dict[str, Any],
+) -> dict[str, Any]:
+    world = backend.world
+    raw_spawns = [
+        {
+            "object": copy.deepcopy(disturbance["object"]),
+            "relation": disturbance["relation"],
+            "target": disturbance["target"],
+        },
+        *copy.deepcopy(disturbance.get("component_objects", [])),
+    ]
+    spawned: list[tuple[Node, NodeState, str | None]] = []
+    new_ids: set[str] = set()
+    has_components = len(raw_spawns) > 1
+
+    for spawn_index, spawn in enumerate(raw_spawns):
+        object_spec = spawn["object"]
+        object_id = str(object_spec["id"])
+        if object_id in world.states or object_id in new_ids:
+            raise ValueError(
+                f"manifest add_object node {object_id!r} must be absent and unique"
+            )
+        new_ids.add(object_id)
+
+        copy_from = object_spec.pop("copy_from", None)
+        copied_from_id: str | None = None
+        if copy_from is not None:
+            copied_from_id = _resolve_disturbance_node_id(
+                backend,
+                copy_from,
+                f"component_objects[{spawn_index}].object.copy_from",
+            )
+            node_payload = _copy_from_node_payload(
+                world.states[copied_from_id].node,
+                object_spec,
+            )
+            # The registry supplies a natural identity. Behavioral attributes
+            # always come from the actual copy_from node in the profiled graph.
+        else:
+            node_payload = object_spec
+        node = Node.from_dict(node_payload)
+
+        relation = spawn["relation"]
+        target_id = _resolve_disturbance_node_id(
+            backend,
+            spawn["target"],
+            f"component_objects[{spawn_index}].target",
+        )
+        if target_id == node.id:
+            raise ValueError("manifest add_object cannot place a node onto/inside itself")
+        target = world.states[target_id]
+        if relation == "ON" and not target.node.is_surface:
+            raise ValueError(f"manifest add_object ON target is not a surface: {target_id}")
+        if relation == "INSIDE" and not target.node.is_container:
+            raise ValueError(
+                f"manifest add_object INSIDE target is not a container: {target_id}"
+            )
+        state = NodeState(
+            node=node,
+            location_relation=relation,
+            location_target=target_id,
+            open="OPEN" in node.states,
+            assembled=("ASSEMBLED" in node.states and not has_components),
+            pressed="PRESSED" in node.states,
+        )
+        spawned.append((node, state, copied_from_id))
+
+    node, state, copied_from_id = spawned[0]
+
+    success_policy = disturbance["success_policy"]
+    policy_type = success_policy["type"]
+    goal_update: dict[str, Any] = {"type": policy_type, "changed": False}
+    inherited_expression: Any | None = None
+    if policy_type == "inherit_from":
+        source_expression, source_id = _manifest_goal_for_node(
+            backend,
+            success_policy.get("source_node_id"),
+            field="success_policy.source_node_id",
+        )
+        placement_alternatives = [
+            str(value)
+            for value in success_policy.get("placement_alternatives") or []
+        ]
+        source_placement_targets: list[str] = []
+        for predicate, args in _goal_atoms(source_expression):
+            relation = normalize_relation(predicate)
+            relation = "INSIDE" if relation == "IN" else relation
+            if relation not in {"INSIDE", "ON"} or len(args) < 2:
+                continue
+            if world.resolve_node_id(args[0]) != source_id:
+                continue
+            target_id = world.resolve_node_id(args[1])
+            if target_id is not None and target_id not in source_placement_targets:
+                source_placement_targets.append(target_id)
+        if placement_alternatives and set(placement_alternatives) != set(
+            source_placement_targets
+        ):
+            raise ValueError(
+                "manifest inherit_from placement_alternatives must exactly match "
+                f"the source goal targets: expected {source_placement_targets}, "
+                f"got {placement_alternatives}"
+            )
+        inherited_expression = _replace_goal_subject(
+            source_expression,
+            lambda raw: world.resolve_node_id(raw) == source_id,
+            node.id,
+        )
+        goal_update.update(
+            {
+                "source_node_id": source_id,
+                "source_expression": source_expression,
+                "placement_alternatives": placement_alternatives,
+                "added_expression": inherited_expression,
+            }
+        )
+    elif policy_type == "existing_task_goal":
+        references = {node.id, node.name}
+        existing_expression = _project_goal_expression(
+            backend.evaluator.task.task_completion_criterion,
+            lambda raw: str(raw) in references,
+        )
+        if existing_expression is None:
+            raise ValueError(
+                "manifest add_object existing_task_goal requires the initial task "
+                f"criterion to reference {node.id!r}/{node.name!r}"
+            )
+        goal_update["existing_expression"] = existing_expression
+    else:
+        trigger_container_id = _resolve_disturbance_node_id(
+            backend,
+            success_policy.get("trigger_container_id"),
+            "success_policy.trigger_container_id",
+        )
+        trigger_container = world.states[trigger_container_id].node
+        references = {node.id, node.name}
+        existing_expression = _project_goal_expression(
+            backend.evaluator.task.task_completion_criterion,
+            lambda raw: str(raw) in references,
+        )
+        if existing_expression is not None:
+            raise ValueError(
+                "manifest add_object trigger_container_goal requires the initial task "
+                f"criterion not to reference {node.id!r}/{node.name!r}"
+            )
+        inherited_expression = [
+            success_policy.get("predicate", "INSIDE"),
+            node.name,
+            trigger_container.name,
+        ]
+        goal_update.update(
+            {
+                "trigger_container_id": trigger_container_id,
+                "trigger_container_name": trigger_container.name,
+                "added_expression": inherited_expression,
+            }
+        )
+
+    for spawned_node, spawned_state, _ in spawned:
+        world.states[spawned_node.id] = spawned_state
+        world._name_to_id.setdefault(spawned_node.id, spawned_node.id)
+        world._name_to_id.setdefault(spawned_node.name, spawned_node.id)
+        world._name_to_id.setdefault(spawned_node.name.lower(), spawned_node.id)
+
+    if inherited_expression is not None:
+        previous_criterion = copy.deepcopy(
+            backend.evaluator.task.task_completion_criterion
+        )
+        if policy_type == "inherit_from":
+            backend.evaluator.task.task_completion_criterion = {
+                "and": [
+                    normalize_goal_expression(previous_criterion),
+                    inherited_expression,
+                ]
+            }
+        else:
+            backend.evaluator.task.task_completion_criterion = _append_goal_conjunct(
+                previous_criterion,
+                inherited_expression,
+            )
+        goal_update.update(
+            {
+                "changed": True,
+                "previous_criterion": previous_criterion,
+                "effective_criterion": copy.deepcopy(
+                    backend.evaluator.task.task_completion_criterion
+                ),
+            }
+        )
+
+    return {
+        "node_id": node.id,
+        "node": _node_to_condition_object_spec(node),
+        "new_location": {
+            "relation": state.location_relation,
+            "target": state.location_target,
+            "held": state.held,
+        },
+        "copied_from": copied_from_id,
+        "component_node_ids": [item[0].id for item in spawned[1:]],
+        "components": [
+            {
+                "node": _node_to_condition_object_spec(component_node),
+                "copied_from": component_source,
+                "new_location": {
+                    "relation": component_state.location_relation,
+                    "target": component_state.location_target,
+                    "held": component_state.held,
+                },
+            }
+            for component_node, component_state, component_source in spawned[1:]
+        ],
+        "goal_update": goal_update,
+    }
+
+
 def _apply_graph_disturbance(
     backend: SymbolicBackend,
     disturbance: dict[str, Any],
 ) -> dict[str, Any]:
     operation = disturbance["operation"]
     world = backend.world
+    if operation == "add_object":
+        return _apply_manifest_add_object(backend, disturbance)
+    if operation == "relocate_and_add_occlusion":
+        target_id = _resolve_disturbance_node_id(backend, disturbance["target"], "target")
+        expected_location = disturbance.get("previous_location")
+        if not isinstance(expected_location, dict):
+            raise ValueError(
+                "graph disturbance relocate_and_add_occlusion needs previous_location"
+            )
+        target_state = world.states[target_id]
+        expected_relation = normalize_relation(str(expected_location.get("relation") or ""))
+        expected_relation = "INSIDE" if expected_relation == "IN" else expected_relation
+        expected_target = _resolve_disturbance_node_id(
+            backend, expected_location.get("target"), "previous_location.target"
+        )
+        if (
+            target_state.location_relation != expected_relation
+            or target_state.location_target != expected_target
+            or target_state.held
+        ):
+            raise ValueError(
+                "graph disturbance target no longer matches its recorded completed placement"
+            )
+        relocation = _apply_graph_disturbance(
+            backend,
+            {
+                "operation": "relocate",
+                "node_id": target_id,
+                "relation": disturbance["staging_relation"],
+                "target": disturbance["staging_target"],
+            },
+        )
+        occlusion = _apply_graph_disturbance(
+            backend,
+            {
+                "operation": "add_occlusion",
+                "source": disturbance["source"],
+                "target": target_id,
+                "relation": disturbance.get("relation", "OCCLUDES"),
+                "resolution_action": disturbance.get("resolution_action"),
+                "activate": disturbance.get("activate", True),
+            },
+        )
+        return {
+            "target": target_id,
+            "previous_location": copy.deepcopy(expected_location),
+            "staging_location": copy.deepcopy(relocation["new_location"]),
+            "relocation": relocation,
+            "occlusion": occlusion,
+        }
+
     if operation == "set_state":
         node_id = _resolve_disturbance_node_id(backend, disturbance["node_id"], "node_id")
         state = world.states[node_id]
@@ -1522,6 +2569,10 @@ def _apply_graph_disturbance(
             if relation == "INSIDE" and not target.node.is_container:
                 raise ValueError(f"graph disturbance INSIDE target is not a container: {target_id}")
         world._remove_occlusions_for_location_change(node_id)
+        # An external relocation invalidates the object's old memory-only hiding
+        # anchor. Visibility at the new location is still governed by closed
+        # containers and active occlusion edges below.
+        world.memory_hidden.pop(node_id, None)
         state.held = False
         state.location_relation = relation
         state.location_target = target_id
@@ -1649,7 +2700,9 @@ def _expected_recovery_from_history(history: list[dict[str, Any]]) -> dict[str, 
     }
 
 
-def _teacher_non_stop_step_count(episode: dict[str, Any]) -> int:
+def _teacher_non_stop_step_count(episode: dict[str, Any]) -> int | None:
+    if episode.get("teacher_reference_available") is False:
+        return None
     count = 0
     for step in episode.get("trajectory", []) or []:
         if not isinstance(step, dict):
@@ -1672,12 +2725,16 @@ def _episode_outcome(
     goal_damaged_after_satisfaction: bool,
     initial_cost: float,
     initial_planning_cost: float,
-    teacher_step_count: int,
+    teacher_step_count: int | None,
     injected_failure_count: int,
     disturbance_count: int,
     disturbance_cleanup_count: int,
     condition_id: str | None,
     intervention_type: str | None,
+    added_object_goal_expression: Any | None,
+    added_object_goal_activation_step: int | None,
+    first_added_object_goal_satisfied_step: int | None,
+    added_object_goal_model_steps_to_satisfaction: int | None,
 ) -> dict[str, Any]:
     final_goal_satisfied = bool(_safe_backend_success(backend))
     final_cost = _relaxed_completion_cost(backend)
@@ -1691,8 +2748,8 @@ def _episode_outcome(
     )
     efficiency = (
         min(1.0, teacher_step_count / max(1, model_non_stop_steps))
-        if success
-        else 0.0
+        if success and teacher_step_count is not None
+        else (0.0 if teacher_step_count is not None else None)
     )
     intervention_count = injected_failure_count + disturbance_count
     intervention_steps = [
@@ -1705,6 +2762,11 @@ def _episode_outcome(
             if isinstance(report, dict)
         )
     ]
+    added_object_goal_eligible = added_object_goal_expression is not None
+    final_added_object_goal_satisfied = _goal_expression_satisfied(
+        backend,
+        added_object_goal_expression,
+    )
     return {
         "condition_id": condition_id,
         "intervention_type": intervention_type,
@@ -1735,6 +2797,23 @@ def _episode_outcome(
         "intervention_applied": intervention_count > 0,
         "intervention_count": intervention_count,
         "first_intervention_step": min(intervention_steps) if intervention_steps else None,
+        "added_object_goal": {
+            "eligible": added_object_goal_eligible,
+            "expression": copy.deepcopy(added_object_goal_expression),
+            "activation_step": added_object_goal_activation_step,
+            "ever_satisfied": (
+                first_added_object_goal_satisfied_step is not None
+                if added_object_goal_eligible
+                else None
+            ),
+            "first_satisfied_step": first_added_object_goal_satisfied_step,
+            "final_satisfied": final_added_object_goal_satisfied,
+            "model_steps_to_satisfaction": (
+                added_object_goal_model_steps_to_satisfaction
+                if added_object_goal_eligible
+                else None
+            ),
+        },
     }
 
 
@@ -1760,13 +2839,25 @@ def _closed_loop_summary(
         for record in records
         if record.get("normally_executable") is not None
     ]
+    added_object_goal_outcomes = [
+        item["added_object_goal"]
+        for item in outcomes
+        if isinstance(item.get("added_object_goal"), dict)
+        and item["added_object_goal"].get("eligible") is True
+    ]
     outcome_metrics = {
         "episode_count": len(outcomes),
         "task_success_rate": mean([float(item["success"]) for item in outcomes]),
         "goal_ever_satisfied_rate": mean([float(item["goal_ever_satisfied"]) for item in outcomes]),
         "final_goal_satisfied_rate": mean([float(item["final_goal_satisfied"]) for item in outcomes]),
         "normalized_goal_progress": mean([float(item["normalized_goal_progress"]) for item in outcomes]),
-        "teacher_normalized_efficiency": mean([float(item["teacher_normalized_efficiency"]) for item in outcomes]),
+        "teacher_normalized_efficiency": mean(
+            [
+                float(item["teacher_normalized_efficiency"])
+                for item in outcomes
+                if item.get("teacher_normalized_efficiency") is not None
+            ]
+        ),
         "average_step_count": mean([float(item["step_count"]) for item in outcomes]),
         "action_executability_rate": mean(normal_executability),
         "episodes_with_injected_failure_rate": mean(
@@ -1786,6 +2877,28 @@ def _closed_loop_summary(
         ),
         "average_intervention_count": mean(
             [float(item["intervention_count"]) for item in outcomes]
+        ),
+        "added_object_goal_eligible_episode_count": len(
+            added_object_goal_outcomes
+        ),
+        "added_object_goal_ever_satisfied_rate": mean(
+            [
+                float(item["ever_satisfied"])
+                for item in added_object_goal_outcomes
+            ]
+        ),
+        "added_object_goal_final_satisfied_rate": mean(
+            [
+                float(item["final_satisfied"])
+                for item in added_object_goal_outcomes
+            ]
+        ),
+        "average_added_object_goal_model_steps_to_satisfaction": mean(
+            [
+                float(item["model_steps_to_satisfaction"])
+                for item in added_object_goal_outcomes
+                if item.get("model_steps_to_satisfaction") is not None
+            ]
         ),
         "parse_success_rate": mean(
             [
