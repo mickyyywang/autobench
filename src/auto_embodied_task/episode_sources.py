@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+
 from .harness import SymbolicBackend
 from .models import TaskRecord, ViewGraph
 from .placement_constraints import PlacementEdgeConstraints
